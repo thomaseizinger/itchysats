@@ -1,15 +1,14 @@
-use crate::cfd::{Cfd, CfdTakeRequest, static_cfd_offer, Usd};
+use crate::cfd::{static_cfd_offer, Cfd, CfdState, CfdTakeRequest, Usd};
 
-use rocket::{State, Shutdown};
-use rocket::fs::{relative, FileServer};
-use rocket::form::Form;
-use rocket::response::stream::{EventStream, Event};
-use rocket::tokio::sync::broadcast::{channel, Sender, error::RecvError};
-use rocket::tokio::select;
-use rust_decimal_macros::dec;
 use bitcoin::Amount;
+use rocket::form::Form;
+use rocket::fs::{relative, FileServer};
+use rocket::response::stream::{Event, EventStream};
+use rocket::tokio::select;
+use rocket::tokio::sync::broadcast::{channel, error::RecvError, Sender};
+use rocket::{Shutdown, State};
+use rust_decimal_macros::dec;
 use std::time::SystemTime;
-
 
 /// Returns an infinite stream of server-sent events. Each event is a message
 /// pulled from a broadcast queue sent by the `post` handler.
@@ -35,7 +34,6 @@ async fn events(queue: &State<Sender<Cfd>>, mut end: Shutdown) -> EventStream![]
 /// Receive a cfd from a form submission and broadcast it to any receivers.
 #[post("/cfd", data = "<cfd_take_request>")]
 fn post_cfd(cfd_take_request: CfdTakeRequest, queue: &State<Sender<Cfd>>) {
-
     // TODO: Communicate with maker to initiate taking CFD...
 
     // TODO: Keep the offer of the maker around on disk, separate task that keeps it up to date ...
@@ -51,7 +49,7 @@ fn post_cfd(cfd_take_request: CfdTakeRequest, queue: &State<Sender<Cfd>>) {
         profit_btc: Amount::ZERO,
         profit_usd: Usd(0),
         creation_date: SystemTime::now(),
-        state: CfdState::TakeRequested
+        state: CfdState::TakeRequested,
     };
 
     let _res = queue.send(cfd);

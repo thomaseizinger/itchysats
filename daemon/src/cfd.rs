@@ -1,18 +1,24 @@
-use uuid::Uuid;
-use std::time::SystemTime;
 use bitcoin::Amount;
+use rocket::{FromForm, FromFormField};
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+use uuid::Uuid;
 
-pub struct Usd(u64);
+#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
+pub struct Usd(pub u64);
 
+#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
 pub struct Leverage(u8);
 
+#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
 pub enum TradingPair {
     BtcUsd,
-};
+}
 
+#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
 pub enum Position {
     Buy,
-    Sell
+    Sell,
 }
 
 /// A concrete offer for a user
@@ -23,7 +29,6 @@ pub struct CfdOffer {
     pub price: Usd,
 
     // TODO: [post-MVP] Representation of the contract size; at the moment the contract size is always 1 USD
-
     pub min_amount: Usd,
     pub max_amount: Usd,
 
@@ -35,7 +40,6 @@ pub struct CfdOffer {
     pub liquidation_price: Usd,
 }
 
-
 /// The taker POSTs this to create a Cfd
 #[derive(Debug, Clone, FromForm, Deserialize)]
 pub struct CfdTakeRequest {
@@ -43,19 +47,20 @@ pub struct CfdTakeRequest {
     pub quantity: Usd,
 }
 
-#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
-enum Error {
+#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
+pub enum Error {
     // TODO
+    ConnectionLost,
 }
 
 #[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
-struct CfdStateError {
+pub struct CfdStateError {
     last_successful_state: CfdState,
     error: Error,
 }
 
-#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
-enum CfdState {
+#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
+pub enum CfdState {
     /// The taker has sent an open request
     TakeRequested,
     /// We have sent a request to the maker to open the CFD but don't have a response yet
@@ -70,8 +75,8 @@ enum CfdState {
     PendingClose,
     /// The close transaction is confirmed with at least one block
     Closed,
-
-    Error(CfdStateError),
+    // FIXME: add CfdError
+    Error,
 }
 
 /// Represents a cfd (including state)
@@ -102,6 +107,6 @@ pub fn static_cfd_offer() -> CfdOffer {
         max_amount: Usd(10_000),
         leverage: Leverage(5),
         trading_pair: TradingPair::BtcUsd,
-        liquidation_price: Usd(42_000)
+        liquidation_price: Usd(42_000),
     }
 }
