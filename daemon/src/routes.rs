@@ -1,12 +1,14 @@
 use crate::cfd::{static_cfd_offer, Cfd, CfdState, CfdTakeRequest, Usd};
 
+use anyhow::Result;
 use bitcoin::Amount;
 use rocket::{
+    fs::{relative, FileServer},
     response::stream::{Event, EventStream},
     serde::json::Json,
     tokio::{
         select,
-        sync::broadcast::{error::RecvError, Sender},
+        sync::broadcast::{channel, error::RecvError, Sender},
     },
     Shutdown, State,
 };
@@ -58,4 +60,15 @@ fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<Sender<Cfd>>) 
     };
 
     let _res = queue.send(cfd);
+}
+
+pub async fn start_http() -> Result<()> {
+    rocket::build()
+        .manage(channel::<Cfd>(1024).0)
+        .mount("/", routes![post_cfd, cfd_stream])
+        .mount("/", FileServer::from(relative!("static")))
+        .launch()
+        .await?;
+
+    Ok(())
 }

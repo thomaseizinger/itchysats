@@ -4,6 +4,11 @@ mod routes;
 #[macro_use]
 extern crate rocket;
 
-fn main() {
-    println!("Hello, world!");
+use anyhow::Result;
+
+#[rocket::main]
+async fn main() -> Result<()> {
+    routes::start_http().await?;
+
+    Ok(())
 }
