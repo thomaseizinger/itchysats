@@ -1,28 +1,27 @@
 use bitcoin::Amount;
-use rocket::{FromForm, FromFormField};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usd(pub u64);
 
-#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Leverage(u8);
 
-#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradingPair {
     BtcUsd,
 }
 
-#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Position {
     Buy,
     Sell,
 }
 
 /// A concrete offer for a user
-#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CfdOffer {
     pub id: Uuid,
 
@@ -41,25 +40,25 @@ pub struct CfdOffer {
 }
 
 /// The taker POSTs this to create a Cfd
-#[derive(Debug, Clone, FromForm, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CfdTakeRequest {
     pub offer_id: Uuid,
     pub quantity: Usd,
 }
 
-#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Error {
     // TODO
     ConnectionLost,
 }
 
-#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CfdStateError {
     last_successful_state: CfdState,
     error: Error,
 }
 
-#[derive(Debug, Clone, FromFormField, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CfdState {
     /// The taker has sent an open request
     TakeRequested,
@@ -80,7 +79,7 @@ pub enum CfdState {
 }
 
 /// Represents a cfd (including state)
-#[derive(Debug, Clone, FromForm, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cfd {
     pub initial_price: Usd,
 
@@ -88,9 +87,11 @@ pub struct Cfd {
     pub trading_pair: TradingPair,
     pub liquidation_price: Usd,
 
+    #[serde(with = "::bitcoin::util::amount::serde::as_sat")]
     pub quantity_btc: Amount,
     pub quantity_usd: Usd,
 
+    #[serde(with = "::bitcoin::util::amount::serde::as_sat")]
     pub profit_btc: Amount,
     pub profit_usd: Usd,
 

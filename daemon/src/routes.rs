@@ -1,19 +1,22 @@
 use crate::cfd::{static_cfd_offer, Cfd, CfdState, CfdTakeRequest, Usd};
 
 use bitcoin::Amount;
-use rocket::form::Form;
-use rocket::fs::{relative, FileServer};
-use rocket::response::stream::{Event, EventStream};
-use rocket::tokio::select;
-use rocket::tokio::sync::broadcast::{channel, error::RecvError, Sender};
-use rocket::{Shutdown, State};
+use rocket::{
+    response::stream::{Event, EventStream},
+    serde::json::Json,
+    tokio::{
+        select,
+        sync::broadcast::{error::RecvError, Sender},
+    },
+    Shutdown, State,
+};
 use rust_decimal_macros::dec;
 use std::time::SystemTime;
 
 /// Returns an infinite stream of server-sent events. Each event is a message
 /// pulled from a broadcast queue sent by the `post` handler.
 #[get("/cfds")]
-async fn events(queue: &State<Sender<Cfd>>, mut end: Shutdown) -> EventStream![] {
+async fn cfd_stream(queue: &State<Sender<Cfd>>, mut end: Shutdown) -> EventStream![] {
     let mut rx = queue.subscribe();
     EventStream! {
         loop {
@@ -33,10 +36,11 @@ async fn events(queue: &State<Sender<Cfd>>, mut end: Shutdown) -> EventStream![]
 
 /// Receive a cfd from a form submission and broadcast it to any receivers.
 #[post("/cfd", data = "<cfd_take_request>")]
-fn post_cfd(cfd_take_request: CfdTakeRequest, queue: &State<Sender<Cfd>>) {
+fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<Sender<Cfd>>) {
     // TODO: Communicate with maker to initiate taking CFD...
+    //  How would we achieve long running async stuff in here?
 
-    // TODO: Keep the offer of the maker around on disk, separate task that keeps it up to date ...
+    // TODO: Keep the offer of the maker around n state + separate task that keeps it up to date ...
     let current_offer = static_cfd_offer();
 
     let cfd = Cfd {
@@ -44,8 +48,9 @@ fn post_cfd(cfd_take_request: CfdTakeRequest, queue: &State<Sender<Cfd>>) {
         leverage: current_offer.leverage,
         trading_pair: current_offer.trading_pair,
         liquidation_price: current_offer.liquidation_price,
-        quantity_btc: todo!("calculate btc value from quantity and price"),
-        quantity_usd: cfd_take_request.quantity,
+        // TODO calculate btc value from quantity and price
+        quantity_btc: Amount::ZERO,
+        quantity_usd: cfd_take_request.quantity.clone(),
         profit_btc: Amount::ZERO,
         profit_usd: Usd(0),
         creation_date: SystemTime::now(),
