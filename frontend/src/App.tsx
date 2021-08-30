@@ -5,22 +5,122 @@ import {
     Flex,
     Grid,
     HStack,
-    Input,
+    NumberDecrementStepper,
+    NumberIncrementStepper,
+    NumberInput,
+    NumberInputField,
+    NumberInputStepper,
     SimpleGrid,
     StackDivider,
     Text,
+    toast,
+    useToast,
     VStack,
 } from "@chakra-ui/react";
-import React, { ReactElement } from "react";
-import { SSEProvider, useSSE } from "react-hooks-sse";
+import React, { ReactElement, useState } from "react";
+import { useAsync } from "react-async";
 import { Link as RouteLink, Route, Switch } from "react-router-dom";
+import { useEventSource, useEventSourceListener } from "react-sse-hooks";
 import "./App.css";
 import CFD from "./components/CFD";
 
-function App() {
-    let offer = useSSE("offer", null);
+function useLatestEvent<T>(source: EventSource, event_name: string): T | null {
+    const [state, setState] = useState<T | null>(null);
 
-    console.log(JSON.stringify(offer));
+    useEventSourceListener<T | null>(
+        {
+            source: source,
+            startOnInit: true,
+            event: {
+                name: event_name,
+                listener: ({ data }) => setState(data),
+            },
+        },
+        [source],
+    );
+
+    return state;
+}
+
+interface Offer {
+    id: string;
+    price: number;
+    min_amount: number;
+    max_amount: number;
+    leverage: number;
+    trading_pair: string;
+    liquidation_price: number;
+}
+
+interface Cfd {
+    initial_price: number;
+
+    leverage: number;
+    trading_pair: string;
+    liquidation_price: number;
+    quantity_btc: number;
+    quantity_usd: number;
+    profit_btc: number;
+    profit_usd: number;
+    creation_date: string;
+    state: string;
+}
+
+interface CfdTakeRequestPayload {
+    offer_id: string;
+    quantity: number;
+}
+
+async function postCfdTakeRequest(payload: CfdTakeRequestPayload) {
+    let res = await fetch(`http://localhost:8000/cfd`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+    });
+
+    if (res.status !== 200) {
+        throw new Error("failed to create new swap");
+    }
+
+    return await res.text();
+}
+
+function App() {
+    /* TODO: Change from localhost:8000 */
+    let source = useEventSource({ source: "http://localhost:8000/feed" });
+
+    let [quantity, setQuantity] = useState<number | null>(null);
+
+    const toast = useToast();
+
+    const format = (val: any) => `$` + val;
+    const parse = (val: any) => val.replace(/^\$/, "");
+
+    const cfds = useLatestEvent<Cfd>(source, "cfds");
+    const offer = useLatestEvent<Offer>(source, "offer");
+    const balance = useLatestEvent<number>(source, "balance");
+
+    let { run: makeNewTakeRequest, isLoading: isCreatingNewTakeRequest } = useAsync({
+        deferFn: async ([payload]: any[]) => {
+            let tx;
+            try {
+                tx = await postCfdTakeRequest(payload as CfdTakeRequestPayload);
+            } catch (e) {
+                const description = typeof e === "string" ? e : JSON.stringify(e);
+
+                toast({
+                    title: "Error",
+                    description,
+                    status: "error",
+                    duration: 9000,
+                    isClosable: true,
+                });
+            }
+        },
+    });
 
     return (
         <Center marginTop={50}>
@@ -70,15 +170,25 @@ function App() {
                                     <VStack spacing={5} shadow={"md"} padding={5} align={"stretch"}>
                                         <HStack>
                                             <Text align={"left"}>Your balance:</Text>
-                                            <Text>10323</Text>
+                                            <Text>{balance}</Text>
                                         </HStack>
                                         <HStack>
                                             <Text align={"left"}>Current Price:</Text>
-                                            <Text>49000</Text>
+                                            <Text>{offer?.price}</Text>
                                         </HStack>
                                         <HStack>
                                             <Text>Quantity:</Text>
-                                            <Input></Input>
+                                            <NumberInput
+                                                onChange={(valueString: string | null) =>
+                                                    setQuantity(parse(valueString))}
+                                                value={format(quantity)}
+                                            >
+                                                <NumberInputField />
+                                                <NumberInputStepper>
+                                                    <NumberIncrementStepper />
+                                                    <NumberDecrementStepper />
+                                                </NumberInputStepper>
+                                            </NumberInput>
                                         </HStack>
                                         <Text>Leverage:</Text>
                                         {/* TODO: consider button group */}
@@ -87,7 +197,17 @@ function App() {
                                             <Button disabled={true}>x2</Button>
                                             <Button colorScheme="blue" variant="solid">x5</Button>
                                         </Flex>
-                                        <Button variant={"solid"} colorScheme={"blue"}>BUY</Button>
+                                        {<Button
+                                            variant={"solid"}
+                                            colorScheme={"blue"}
+                                            onClick={() =>
+                                                makeNewTakeRequest({
+                                                    uuid: offer?.id,
+                                                    quantity,
+                                                })}
+                                        >
+                                            BUY
+                                        </Button>}
                                     </VStack>
                                 </Flex>
                             </Flex>

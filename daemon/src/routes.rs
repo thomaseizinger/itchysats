@@ -32,7 +32,7 @@ impl ToSseEvent for CfdOffer {
 
 impl ToSseEvent for Amount {
     fn to_sse_event(&self) -> Event {
-        Event::json(&self.as_sat()).event("balance")
+        Event::json(&self.as_btc()).event("balance")
     }
 }
 
@@ -103,7 +103,7 @@ fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<mpsc::Sender<C
 pub async fn start_http() -> Result<()> {
     let (cfd_feed_sender, cfd_feed_receiver) = channel::<Vec<Cfd>>(vec![]);
     let (_offer_feed_sender, offer_feed_receiver) = channel::<CfdOffer>(static_cfd_offer());
-    let (_balance_feed_sender, balance_feed_receiver) = channel::<Amount>(Amount::ZERO);
+    let (_balance_feed_sender, balance_feed_receiver) = channel::<Amount>(Amount::ONE_BTC);
 
     let (take_cfd_sender, mut take_cfd_receiver) = mpsc::channel::<Cfd>(1024);
 

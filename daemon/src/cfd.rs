@@ -87,11 +87,11 @@ pub struct Cfd {
     pub trading_pair: TradingPair,
     pub liquidation_price: Usd,
 
-    #[serde(with = "::bitcoin::util::amount::serde::as_sat")]
+    #[serde(with = "::bitcoin::util::amount::serde::as_btc")]
     pub quantity_btc: Amount,
     pub quantity_usd: Usd,
 
-    #[serde(with = "::bitcoin::util::amount::serde::as_sat")]
+    #[serde(with = "::bitcoin::util::amount::serde::as_btc")]
     pub profit_btc: Amount,
     pub profit_usd: Usd,
 
