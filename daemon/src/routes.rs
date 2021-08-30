@@ -1,48 +1,59 @@
-use crate::cfd::{static_cfd_offer, Cfd, CfdState, CfdTakeRequest, Usd};
+use crate::cfd::{static_cfd_offer, Cfd, CfdOffer, CfdState, CfdTakeRequest, Usd};
 
 use anyhow::Result;
 use bitcoin::Amount;
 use rocket::{
-    fs::{relative, FileServer},
-    response::stream::{Event, EventStream},
+    fairing::{Fairing, Info, Kind},
+    http::Header,
+    response::stream::EventStream,
     serde::json::Json,
     tokio::{
         select,
-        sync::broadcast::{channel, error::RecvError, Sender},
+        sync::watch::{channel, error::RecvError, Sender},
     },
-    Shutdown, State,
+    Request, Response, Shutdown, State,
 };
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+use tokio::sync::{mpsc, mpsc::Receiver, watch};
 
-/// Returns an infinite stream of server-sent events. Each event is a message
-/// pulled from a broadcast queue sent by the `post` handler.
-#[get("/cfds")]
-async fn cfd_stream(queue: &State<Sender<Cfd>>, mut end: Shutdown) -> EventStream![] {
-    let mut rx = queue.subscribe();
-    EventStream! {
-        loop {
-            let msg = select! {
-                msg = rx.recv() => match msg {
-                    Ok(msg) => msg,
-                    Err(RecvError::Closed) => break,
-                    Err(RecvError::Lagged(_)) => continue,
-                },
-                _ = &mut end => break,
-            };
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum Event {
+    Cfd(Cfd),
+    Offer(CfdOffer),
+}
 
-            yield Event::json(&msg);
+impl Event {
+    pub fn to_sse_event(&self) -> rocket::response::stream::Event {
+        match self {
+            Event::Cfd(cfd) => rocket::response::stream::Event::json(&cfd).event("cfd"),
+            Event::Offer(offer) => rocket::response::stream::Event::json(&offer).event("offer"),
         }
     }
 }
 
-/// Receive a cfd from a form submission and broadcast it to any receivers.
+#[get("/feed")]
+async fn events(rx: &State<watch::Receiver<Event>>, mut end: Shutdown) -> EventStream![] {
+    let mut rx = rx.inner().clone();
+
+    EventStream! {
+        let event = rx.borrow().clone();
+        yield event.to_sse_event();
+
+        while rx.changed().await.is_ok() {
+            let event = rx.borrow().clone();
+            yield event.to_sse_event();
+        }
+    }
+}
+
 #[post("/cfd", data = "<cfd_take_request>")]
-fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<Sender<Cfd>>) {
-    // TODO: Communicate with maker to initiate taking CFD...
-    //  How would we achieve long running async stuff in here?
+fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<mpsc::Sender<Cfd>>) {
+    dbg!(cfd_take_request.clone());
 
     // TODO: Keep the offer of the maker around n state + separate task that keeps it up to date ...
+    //  Just use the database...
     let current_offer = static_cfd_offer();
 
     let cfd = Cfd {
@@ -63,10 +74,26 @@ fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<Sender<Cfd>>) 
 }
 
 pub async fn start_http() -> Result<()> {
+    let (feed_sender, feed_receiver) = channel::<Event>(Event::Offer(static_cfd_offer()));
+    let (cfd_sender, mut cfd_receiver) = mpsc::channel::<Cfd>(1024);
+
+    tokio::spawn({
+        async move {
+            loop {
+                let cfd = cfd_receiver.recv().await.unwrap();
+
+                // TODO: Communicate with maker to initiate taking CFD...
+                //  How would we achieve long running async stuff in here?
+
+                feed_sender.send(Event::Cfd(cfd));
+            }
+        }
+    });
+
     rocket::build()
-        .manage(channel::<Cfd>(1024).0)
-        .mount("/", routes![post_cfd, cfd_stream])
-        .mount("/", FileServer::from(relative!("static")))
+        .manage(feed_receiver)
+        .manage(cfd_sender)
+        .mount("/", routes![events, post_cfd])
         .launch()
         .await?;
 

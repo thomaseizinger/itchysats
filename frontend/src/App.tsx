@@ -11,12 +11,17 @@ import {
     Text,
     VStack,
 } from "@chakra-ui/react";
-import React from "react";
+import React, { ReactElement } from "react";
+import { SSEProvider, useSSE } from "react-hooks-sse";
 import { Link as RouteLink, Route, Switch } from "react-router-dom";
 import "./App.css";
 import CFD from "./components/CFD";
 
 function App() {
+    let offer = useSSE("offer", null);
+
+    console.log(JSON.stringify(offer));
+
     return (
         <Center marginTop={50}>
             <HStack>
@@ -46,8 +51,7 @@ function App() {
                                                     liquidation_price={42000}
                                                     amount={10000}
                                                     profit={200}
-                                                    creation_date={new Date(Date.now(
-                                                    ))}
+                                                    creation_date={new Date(Date.now())}
                                                     status="ongoing"
                                                 />
                                                 <CFD
@@ -55,8 +59,7 @@ function App() {
                                                     liquidation_price={42000}
                                                     amount={12000}
                                                     profit={500}
-                                                    creation_date={new Date(Date.now(
-                                                    ))}
+                                                    creation_date={new Date(Date.now())}
                                                     status="requested"
                                                 />
                                             </SimpleGrid>
