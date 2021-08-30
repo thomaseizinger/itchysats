@@ -5,41 +5,72 @@ use bitcoin::Amount;
 use rocket::{
     response::stream::{Event, EventStream},
     serde::json::Json,
-    tokio::{
-        select,
-        sync::watch::{channel, error::RecvError, Sender},
-    },
-    Request, Response, Shutdown, State,
+    tokio::sync::watch::channel,
+    State,
 };
 use std::time::SystemTime;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    select,
+    sync::{mpsc, watch},
+};
 
-#[get("/cfd/feed")]
-async fn cfd_feed(rx: &State<watch::Receiver<Vec<Cfd>>>) -> EventStream![] {
-    let mut rx = rx.inner().clone();
+trait ToSseEvent {
+    fn to_sse_event(&self) -> Event;
+}
 
-    EventStream! {
-        let cfds = rx.borrow().clone();
-        yield Event::json(&cfds).event("cfds");
-
-        while rx.changed().await.is_ok() {
-            let cfds = rx.borrow().clone();
-            yield Event::json(&cfds).event("cfds");
-        }
+impl ToSseEvent for Vec<Cfd> {
+    fn to_sse_event(&self) -> Event {
+        Event::json(self).event("cfds")
     }
 }
 
-#[get("/cfd/offer/feed")]
-async fn cfd_offer_feed(rx: &State<watch::Receiver<CfdOffer>>) -> EventStream![] {
-    let mut rx = rx.inner().clone();
+impl ToSseEvent for CfdOffer {
+    fn to_sse_event(&self) -> Event {
+        Event::json(self).event("offer")
+    }
+}
+
+impl ToSseEvent for Amount {
+    fn to_sse_event(&self) -> Event {
+        Event::json(&self.as_sat()).event("balance")
+    }
+}
+
+#[get("/feed")]
+async fn feed(
+    rx_cfds: &State<watch::Receiver<Vec<Cfd>>>,
+    rx_offer: &State<watch::Receiver<CfdOffer>>,
+    rx_balance: &State<watch::Receiver<Amount>>,
+) -> EventStream![] {
+    let mut rx_cfds = rx_cfds.inner().clone();
+    let mut rx_offer = rx_offer.inner().clone();
+    let mut rx_balance = rx_balance.inner().clone();
 
     EventStream! {
-        let cfd_offer = rx.borrow().clone();
-        yield Event::json(&cfd_offer).event("offer");
+        let balance = rx_balance.borrow().clone();
+        yield balance.to_sse_event();
 
-        while rx.changed().await.is_ok() {
-            let cfd_offer = rx.borrow().clone();
-            yield Event::json(&cfd_offer).event("offer");
+        let offer = rx_offer.borrow().clone();
+        yield offer.to_sse_event();
+
+        let cfds = rx_cfds.borrow().clone();
+        yield cfds.to_sse_event();
+
+        loop{
+            select! {
+                Ok(()) = rx_balance.changed() => {
+                    let balance = rx_balance.borrow().clone();
+                    yield balance.to_sse_event();
+                },
+                Ok(()) = rx_offer.changed() => {
+                    let offer = rx_offer.borrow().clone();
+                    yield offer.to_sse_event();
+                }
+                Ok(()) = rx_cfds.changed() => {
+                    let cfds = rx_cfds.borrow().clone();
+                    yield cfds.to_sse_event();
+                }
+            }
         }
     }
 }
@@ -71,7 +102,8 @@ fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<mpsc::Sender<C
 
 pub async fn start_http() -> Result<()> {
     let (cfd_feed_sender, cfd_feed_receiver) = channel::<Vec<Cfd>>(vec![]);
-    let (offer_feed_sender, offer_feed_receiver) = channel::<CfdOffer>(static_cfd_offer());
+    let (_offer_feed_sender, offer_feed_receiver) = channel::<CfdOffer>(static_cfd_offer());
+    let (_balance_feed_sender, balance_feed_receiver) = channel::<Amount>(Amount::ZERO);
 
     let (take_cfd_sender, mut take_cfd_receiver) = mpsc::channel::<Cfd>(1024);
 
@@ -84,7 +116,7 @@ pub async fn start_http() -> Result<()> {
                 //  How would we achieve long running async stuff in here?
 
                 // TODO: Always send all the CFDs to notify the UI
-                cfd_feed_sender.send(vec![cfd]);
+                cfd_feed_sender.send(vec![cfd]).unwrap();
             }
         }
     });
@@ -93,7 +125,8 @@ pub async fn start_http() -> Result<()> {
         .manage(offer_feed_receiver)
         .manage(cfd_feed_receiver)
         .manage(take_cfd_sender)
-        .mount("/", routes![cfd_offer_feed, cfd_feed, post_cfd])
+        .manage(balance_feed_receiver)
+        .mount("/", routes![feed, post_cfd])
         .launch()
         .await?;
 
