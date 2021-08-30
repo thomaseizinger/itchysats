@@ -3,9 +3,7 @@ use crate::cfd::{static_cfd_offer, Cfd, CfdOffer, CfdState, CfdTakeRequest, Usd}
 use anyhow::Result;
 use bitcoin::Amount;
 use rocket::{
-    fairing::{Fairing, Info, Kind},
-    http::Header,
-    response::stream::EventStream,
+    response::stream::{Event, EventStream},
     serde::json::Json,
     tokio::{
         select,
@@ -13,37 +11,35 @@ use rocket::{
     },
     Request, Response, Shutdown, State,
 };
-use rust_decimal_macros::dec;
-use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
-use tokio::sync::{mpsc, mpsc::Receiver, watch};
+use tokio::sync::{mpsc, watch};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum Event {
-    Cfd(Cfd),
-    Offer(CfdOffer),
-}
+#[get("/cfd/feed")]
+async fn cfd_feed(rx: &State<watch::Receiver<Vec<Cfd>>>) -> EventStream![] {
+    let mut rx = rx.inner().clone();
 
-impl Event {
-    pub fn to_sse_event(&self) -> rocket::response::stream::Event {
-        match self {
-            Event::Cfd(cfd) => rocket::response::stream::Event::json(&cfd).event("cfd"),
-            Event::Offer(offer) => rocket::response::stream::Event::json(&offer).event("offer"),
+    EventStream! {
+        let cfds = rx.borrow().clone();
+        yield Event::json(&cfds).event("cfds");
+
+        while rx.changed().await.is_ok() {
+            let cfds = rx.borrow().clone();
+            yield Event::json(&cfds).event("cfds");
         }
     }
 }
 
-#[get("/feed")]
-async fn events(rx: &State<watch::Receiver<Event>>, mut end: Shutdown) -> EventStream![] {
+#[get("/cfd/offer/feed")]
+async fn cfd_offer_feed(rx: &State<watch::Receiver<CfdOffer>>) -> EventStream![] {
     let mut rx = rx.inner().clone();
 
     EventStream! {
-        let event = rx.borrow().clone();
-        yield event.to_sse_event();
+        let cfd_offer = rx.borrow().clone();
+        yield Event::json(&cfd_offer).event("offer");
 
         while rx.changed().await.is_ok() {
-            let event = rx.borrow().clone();
-            yield event.to_sse_event();
+            let cfd_offer = rx.borrow().clone();
+            yield Event::json(&cfd_offer).event("offer");
         }
     }
 }
@@ -74,26 +70,30 @@ fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<mpsc::Sender<C
 }
 
 pub async fn start_http() -> Result<()> {
-    let (feed_sender, feed_receiver) = channel::<Event>(Event::Offer(static_cfd_offer()));
-    let (cfd_sender, mut cfd_receiver) = mpsc::channel::<Cfd>(1024);
+    let (cfd_feed_sender, cfd_feed_receiver) = channel::<Vec<Cfd>>(vec![]);
+    let (offer_feed_sender, offer_feed_receiver) = channel::<CfdOffer>(static_cfd_offer());
+
+    let (take_cfd_sender, mut take_cfd_receiver) = mpsc::channel::<Cfd>(1024);
 
     tokio::spawn({
         async move {
             loop {
-                let cfd = cfd_receiver.recv().await.unwrap();
+                let cfd = take_cfd_receiver.recv().await.unwrap();
 
                 // TODO: Communicate with maker to initiate taking CFD...
                 //  How would we achieve long running async stuff in here?
 
-                feed_sender.send(Event::Cfd(cfd));
+                // TODO: Always send all the CFDs to notify the UI
+                cfd_feed_sender.send(vec![cfd]);
             }
         }
     });
 
     rocket::build()
-        .manage(feed_receiver)
-        .manage(cfd_sender)
-        .mount("/", routes![events, post_cfd])
+        .manage(offer_feed_receiver)
+        .manage(cfd_feed_receiver)
+        .manage(take_cfd_sender)
+        .mount("/", routes![cfd_offer_feed, cfd_feed, post_cfd])
         .launch()
         .await?;
 
