@@ -76,7 +76,7 @@ async fn feed(
 }
 
 #[post("/cfd", data = "<cfd_take_request>")]
-fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<mpsc::Sender<Cfd>>) {
+async fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<mpsc::Sender<Cfd>>) {
     dbg!(cfd_take_request.clone());
 
     // TODO: Keep the offer of the maker around n state + separate task that keeps it up to date ...
@@ -97,7 +97,7 @@ fn post_cfd(cfd_take_request: Json<CfdTakeRequest>, queue: &State<mpsc::Sender<C
         state: CfdState::TakeRequested,
     };
 
-    let _res = queue.send(cfd);
+    queue.send(cfd).await.unwrap();
 }
 
 pub async fn start_http() -> Result<()> {

@@ -3,7 +3,6 @@ import {
     Button,
     Center,
     Flex,
-    Grid,
     HStack,
     NumberDecrementStepper,
     NumberIncrementStepper,
@@ -13,16 +12,19 @@ import {
     SimpleGrid,
     StackDivider,
     Text,
-    toast,
     useToast,
     VStack,
 } from "@chakra-ui/react";
-import React, { ReactElement, useState } from "react";
+import axios from "axios";
+import React, { useState } from "react";
 import { useAsync } from "react-async";
 import { Link as RouteLink, Route, Switch } from "react-router-dom";
 import { useEventSource, useEventSourceListener } from "react-sse-hooks";
 import "./App.css";
 import CFD from "./components/CFD";
+
+/* TODO: Change from localhost:8000 */
+const BASE_URL = "http://localhost:8000";
 
 function useLatestEvent<T>(source: EventSource, event_name: string): T | null {
     const [state, setState] = useState<T | null>(null);
@@ -72,42 +74,29 @@ interface CfdTakeRequestPayload {
 }
 
 async function postCfdTakeRequest(payload: CfdTakeRequestPayload) {
-    let res = await fetch(`http://localhost:8000/cfd`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-        },
-        body: JSON.stringify(payload),
-    });
+    let res = await axios.post(BASE_URL + `/cfd`, JSON.stringify(payload));
 
     if (res.status !== 200) {
         throw new Error("failed to create new swap");
     }
-
-    return await res.text();
 }
 
 function App() {
-    /* TODO: Change from localhost:8000 */
-    let source = useEventSource({ source: "http://localhost:8000/feed" });
+    let source = useEventSource({ source: BASE_URL + "/feed" });
 
-    let [quantity, setQuantity] = useState<number | null>(null);
-
-    const toast = useToast();
-
-    const format = (val: any) => `$` + val;
-    const parse = (val: any) => val.replace(/^\$/, "");
-
-    const cfds = useLatestEvent<Cfd>(source, "cfds");
+    const cfds = useLatestEvent<Cfd[]>(source, "cfds");
     const offer = useLatestEvent<Offer>(source, "offer");
     const balance = useLatestEvent<number>(source, "balance");
 
+    const toast = useToast();
+    let [quantity, setQuantity] = useState<string>("10000");
+    const format = (val: any) => `$` + val;
+    const parse = (val: any) => val.replace(/^\$/, "");
+
     let { run: makeNewTakeRequest, isLoading: isCreatingNewTakeRequest } = useAsync({
         deferFn: async ([payload]: any[]) => {
-            let tx;
             try {
-                tx = await postCfdTakeRequest(payload as CfdTakeRequestPayload);
+                await postCfdTakeRequest(payload as CfdTakeRequestPayload);
             } catch (e) {
                 const description = typeof e === "string" ? e : JSON.stringify(e);
 
@@ -146,22 +135,17 @@ function App() {
                                     >
                                         <Box width={"100%"} overflow={"scroll"}>
                                             <SimpleGrid columns={2} spacing={10}>
-                                                <CFD
-                                                    number={1}
-                                                    liquidation_price={42000}
-                                                    amount={10000}
-                                                    profit={200}
-                                                    creation_date={new Date(Date.now())}
-                                                    status="ongoing"
-                                                />
-                                                <CFD
-                                                    number={2}
-                                                    liquidation_price={42000}
-                                                    amount={12000}
-                                                    profit={500}
-                                                    creation_date={new Date(Date.now())}
-                                                    status="requested"
-                                                />
+                                                {cfds && cfds.map((cfd, index) =>
+                                                    <CFD
+                                                        key={"cfd_" + index}
+                                                        number={index}
+                                                        liquidation_price={cfd.liquidation_price}
+                                                        amount={cfd.quantity_usd}
+                                                        profit={cfd.profit_usd}
+                                                        creation_date={cfd.creation_date}
+                                                        status={cfd.state}
+                                                    />
+                                                )}
                                             </SimpleGrid>
                                         </Box>
                                     </VStack>
@@ -179,8 +163,7 @@ function App() {
                                         <HStack>
                                             <Text>Quantity:</Text>
                                             <NumberInput
-                                                onChange={(valueString: string | null) =>
-                                                    setQuantity(parse(valueString))}
+                                                onChange={(valueString: string) => setQuantity(parse(valueString))}
                                                 value={format(quantity)}
                                             >
                                                 <NumberInputField />
@@ -195,16 +178,19 @@ function App() {
                                         <Flex justifyContent={"space-between"}>
                                             <Button disabled={true}>x1</Button>
                                             <Button disabled={true}>x2</Button>
-                                            <Button colorScheme="blue" variant="solid">x5</Button>
+                                            <Button colorScheme="blue" variant="solid">x{offer?.leverage}</Button>
                                         </Flex>
                                         {<Button
+                                            disabled={isCreatingNewTakeRequest}
                                             variant={"solid"}
                                             colorScheme={"blue"}
-                                            onClick={() =>
-                                                makeNewTakeRequest({
-                                                    uuid: offer?.id,
-                                                    quantity,
-                                                })}
+                                            onClick={() => {
+                                                let payload: CfdTakeRequestPayload = {
+                                                    offer_id: offer!.id,
+                                                    quantity: Number.parseFloat(quantity),
+                                                };
+                                                makeNewTakeRequest(payload);
+                                            }}
                                         >
                                             BUY
                                         </Button>}

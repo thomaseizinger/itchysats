@@ -8,8 +8,8 @@ interface CFDProps {
     amount: number;
     liquidation_price: number;
     profit: number;
-    creation_date: Date;
-    status: "requested" | "ongoing" | "pending" | "liquidated";
+    creation_date: string;
+    status: string;
 }
 
 function CFD(
