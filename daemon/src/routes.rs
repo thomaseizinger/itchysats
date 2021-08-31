@@ -2,17 +2,13 @@ use crate::cfd::{static_cfd_offer, Cfd, CfdOffer, CfdState, CfdTakeRequest, Usd}
 
 use anyhow::Result;
 use bitcoin::Amount;
-use rocket::{
-    response::stream::{Event, EventStream},
-    serde::json::Json,
-    tokio::sync::watch::channel,
-    State,
-};
+use rocket::response::stream::{Event, EventStream};
+use rocket::serde::json::Json;
+use rocket::tokio::sync::watch::channel;
+use rocket::State;
 use std::time::SystemTime;
-use tokio::{
-    select,
-    sync::{mpsc, watch},
-};
+use tokio::select;
+use tokio::sync::{mpsc, watch};
 
 trait ToSseEvent {
     fn to_sse_event(&self) -> Event;
