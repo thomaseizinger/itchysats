@@ -1,4 +1,4 @@
-use crate::cfd::{Cfd, CfdOffer, CfdState, CfdTakeRequest, Usd};
+use crate::cfd::{Cfd, CfdOffer};
 
 use anyhow::Result;
 use bitcoin::Amount;
