@@ -1,0 +1,59 @@
+@startuml
+
+/' This represents the complete application state of the taker, not just the CFD '/
+
+[*] --> NoOffer
+NoOffer --> OfferReceived
+OfferReceived --> OfferReceived : update from maker
+OfferReceived --> Taking
+
+state Taking {
+    [*] --> TakeRequested
+    TakeRequested --> SentToMaker
+    TakeRequested --> MakerNotReachable
+    SentToMaker --> Accepted
+    SentToMaker --> Rejected
+
+    state ContractSetup {
+        [*] --> SentSignaturesToMaker
+        SentSignaturesToMaker --> ReceivedSignaturesFromMaker
+        ReceivedSignaturesFromMaker --> WaitingForTxToBePublished
+        WaitingForTxToBePublished --> ContractTxInMempool
+        ContractTxInMempool --> ContractTxConfirmed
+    }
+}
+
+Rejected --> [*]
+MakerNotReachable --> [*]
+MakerNotReachable --> NoOffer
+
+Accepted --> ContractSetup
+
+ContractTxConfirmed --> Open
+Open --> Closing
+Open --> Renewing
+
+state Closing {
+  [*] --> CetTimelockElapsed
+  CetTimelockElapsed --> PublishCet
+  PublishCet --> Confirmed
+
+  [*] --> CollaborativeCloseRequested
+  CollaborativeCloseRequested --> CollaborativeCloseSentToMaker
+  CollaborativeCloseSentToMaker --> CollaborativeCloseAccepted
+  CollaborativeCloseSentToMaker --> CollaborativeCloseRejected
+
+}
+
+CollaborativeCloseRejected --> Open
+
+state Renewing {
+  [*] --> RenewalRequested
+  RenewalRequested --> RenewalSentToMaker
+  RenewalSentToMaker --> RenewalAccepted
+  RenewalSentToMaker --> RenewalRejected
+}
+
+
+
+@enduml
