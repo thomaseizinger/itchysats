@@ -26,6 +26,7 @@ jobs:
       - name: Run clippy with default features
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  test_worspace:
       - name: print hello world
         uses: actions/setup-node@v2
         with:
