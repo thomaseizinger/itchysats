@@ -1,5 +1,6 @@
 use anyhow::Result;
-use bdk::bitcoin::Amount;
+use bdk::bitcoin::{self, Amount};
+use bdk::blockchain::{ElectrumBlockchain, NoopProgress};
 use model::cfd::{Cfd, CfdOffer};
 use rocket::fairing::AdHoc;
 use rocket::figment::util::map;
@@ -22,9 +23,26 @@ pub struct Db(sqlx::SqlitePool);
 
 #[rocket::main]
 async fn main() -> Result<()> {
+    let client =
+        bdk::electrum_client::Client::new("ssl://electrum.blockstream.info:60002").unwrap();
+
+    // TODO: Replace with sqlite once https://github.com/bitcoindevkit/bdk/pull/376 is merged.
+    let db = bdk::sled::open("/tmp/maker.db")?;
+    let wallet_db = db.open_tree("wallet")?;
+
+    let wallet = bdk::Wallet::new(
+        "wpkh(tprv8ZgxMBicQKsPd95j7aKDzWZw9Z2SiLxpz5J5iFUdqFf1unqtoonSTteF1ZSrrB831BY1eufyHehediNH76DvcDSS2JDDyDXCQKJbyd7ozVf/*)#3vkm30lf",
+        None,
+        bitcoin::Network::Testnet,
+        wallet_db,
+        ElectrumBlockchain::from(client),
+    )
+    .unwrap();
+    wallet.sync(NoopProgress, None).unwrap(); // TODO: Use LogProgress once we have logging.
+
     let (cfd_feed_sender, cfd_feed_receiver) = watch::channel::<Vec<Cfd>>(vec![]);
     let (offer_feed_sender, offer_feed_receiver) = watch::channel::<Option<CfdOffer>>(None);
-    let (_balance_feed_sender, balance_feed_receiver) = watch::channel::<Amount>(Amount::ONE_BTC);
+    let (_balance_feed_sender, balance_feed_receiver) = watch::channel::<Amount>(Amount::ZERO);
 
     let db: Map<_, Value> = map! {
         "url" => "./maker.sqlite".into(),
@@ -67,6 +85,7 @@ async fn main() -> Result<()> {
 
             let (cfd_maker_actor, cfd_maker_actor_inbox) = maker_cfd_actor::new(
                 db,
+                wallet,
                 connections_actor_inbox_sender,
                 cfd_feed_sender,
                 offer_feed_sender,

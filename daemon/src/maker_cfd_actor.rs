@@ -20,8 +20,9 @@ pub enum Command {
     },
 }
 
-pub fn new(
+pub fn new<B, D>(
     db: sqlx::SqlitePool,
+    _wallet: bdk::Wallet<B, D>,
     takers: mpsc::UnboundedSender<maker_inc_connections_actor::Command>,
     cfd_feed_sender: watch::Sender<Vec<Cfd>>,
     offer_feed_sender: watch::Sender<Option<CfdOffer>>,

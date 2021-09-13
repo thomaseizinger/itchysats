@@ -12,8 +12,9 @@ pub enum Command {
     OfferAccepted(CfdOfferId),
 }
 
-pub fn new(
+pub fn new<B, D>(
     db: sqlx::SqlitePool,
+    _wallet: bdk::Wallet<B, D>,
     cfd_feed_actor_inbox: watch::Sender<Vec<Cfd>>,
     offer_feed_actor_inbox: watch::Sender<Option<CfdOffer>>,
     out_msg_maker_inbox: mpsc::UnboundedSender<wire::TakerToMaker>,
