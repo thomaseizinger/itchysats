@@ -32,6 +32,11 @@ pub fn new(
                 Ok(wire::MakerToTaker::InvalidOfferId(_)) => {
                     todo!()
                 }
+                Ok(wire::MakerToTaker::SetupContract(msg)) => {
+                    cfd_actor
+                        .send(taker_cfd_actor::Command::IncProtocolMsg(msg))
+                        .unwrap();
+                }
                 Err(error) => {
                     eprintln!("Error in reading message: {}", error);
                 }

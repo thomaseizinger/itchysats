@@ -416,6 +416,7 @@ pub struct PartyParams {
     pub address: Address,
 }
 
+#[derive(Debug, Copy, Clone)]
 pub struct PunishParams {
     pub revocation_pk: PublicKey,
     pub publish_pk: PublicKey,

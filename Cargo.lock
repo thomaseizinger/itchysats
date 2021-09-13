@@ -371,7 +371,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bdk",
+ "cfd_protocol",
  "futures",
+ "rand 0.6.5",
  "rocket",
  "rocket_db_pools",
  "rust_decimal",

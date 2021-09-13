@@ -98,6 +98,7 @@ fn in_taker_messages(
                     })
                     .unwrap(),
                 Ok(wire::TakerToMaker::StartContractSetup(_offer_id)) => {}
+                Ok(wire::TakerToMaker::Protocol(_msg)) => {}
                 Err(error) => {
                     eprintln!("Error in reading message: {}", error);
                 }

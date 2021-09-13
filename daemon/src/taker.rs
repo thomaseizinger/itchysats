@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bdk::bitcoin::secp256k1::{schnorrsig, SECP256K1};
 use bdk::bitcoin::{self, Amount};
 use bdk::blockchain::{ElectrumBlockchain, NoopProgress};
 use model::cfd::{Cfd, CfdOffer};
@@ -9,6 +10,7 @@ use rocket_db_pools::Database;
 use tokio::sync::watch;
 
 mod db;
+mod keypair;
 mod model;
 mod routes_taker;
 mod send_wire_message_actor;
@@ -39,6 +41,8 @@ async fn main() -> Result<()> {
     )
     .unwrap();
     wallet.sync(NoopProgress, None).unwrap(); // TODO: Use LogProgress once we have logging.
+
+    let oracle = schnorrsig::KeyPair::new(SECP256K1, &mut rand::thread_rng()); // TODO: Fetch oracle public key from oracle.
 
     let (cfd_feed_sender, cfd_feed_receiver) = watch::channel::<Vec<Cfd>>(vec![]);
     let (offer_feed_sender, offer_feed_receiver) = watch::channel::<Option<CfdOffer>>(None);
@@ -75,30 +79,34 @@ async fn main() -> Result<()> {
                 }
             },
         ))
-        .attach(AdHoc::try_on_ignite("Create actors", |rocket| async move {
-            let db = match Db::fetch(&rocket) {
-                Some(db) => (**db).clone(),
-                None => return Err(rocket),
-            };
+        .attach(AdHoc::try_on_ignite(
+            "Create actors",
+            move |rocket| async move {
+                let db = match Db::fetch(&rocket) {
+                    Some(db) => (**db).clone(),
+                    None => return Err(rocket),
+                };
 
-            let (out_maker_messages_actor, out_maker_actor_inbox) =
-                send_wire_message_actor::new(write);
-            let (cfd_actor, cfd_actor_inbox) = taker_cfd_actor::new(
-                db,
-                wallet,
-                cfd_feed_sender,
-                offer_feed_sender,
-                out_maker_actor_inbox,
-            );
-            let inc_maker_messages_actor =
-                taker_inc_message_actor::new(read, cfd_actor_inbox.clone());
+                let (out_maker_messages_actor, out_maker_actor_inbox) =
+                    send_wire_message_actor::new(write);
+                let (cfd_actor, cfd_actor_inbox) = taker_cfd_actor::new(
+                    db,
+                    wallet,
+                    schnorrsig::PublicKey::from_keypair(SECP256K1, &oracle),
+                    cfd_feed_sender,
+                    offer_feed_sender,
+                    out_maker_actor_inbox,
+                );
+                let inc_maker_messages_actor =
+                    taker_inc_message_actor::new(read, cfd_actor_inbox.clone());
 
-            tokio::spawn(cfd_actor);
-            tokio::spawn(inc_maker_messages_actor);
-            tokio::spawn(out_maker_messages_actor);
+                tokio::spawn(cfd_actor);
+                tokio::spawn(inc_maker_messages_actor);
+                tokio::spawn(out_maker_messages_actor);
 
-            Ok(rocket.manage(cfd_actor_inbox))
-        }))
+                Ok(rocket.manage(cfd_actor_inbox))
+            },
+        ))
         .mount(
             "/",
             rocket::routes![
