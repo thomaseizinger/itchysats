@@ -1,9 +1,10 @@
 use crate::model::cfd::CfdOfferId;
 use crate::model::Usd;
 use crate::CfdOffer;
+use bdk::bitcoin::secp256k1::Signature;
 use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
-use bdk::bitcoin::{Address, Amount, PublicKey};
-use cfd_protocol::{PartyParams, PunishParams};
+use bdk::bitcoin::{Address, Amount, PublicKey, Txid};
+use cfd_protocol::{CfdTransactions, EcdsaAdaptorSignature, PartyParams, PunishParams};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -11,7 +12,8 @@ use serde::{Deserialize, Serialize};
 #[allow(clippy::large_enum_variant)]
 pub enum TakerToMaker {
     TakeOffer { offer_id: CfdOfferId, quantity: Usd },
-    // TODO: Currently the taker starts, can already send some stuff for signing over in the first message.
+    // TODO: Currently the taker starts, can already send some stuff for signing over in the first
+    // message.
     StartContractSetup(CfdOfferId),
     Protocol(SetupMsg),
 }
@@ -31,6 +33,7 @@ pub enum MakerToTaker {
 #[serde(tag = "type", content = "payload")]
 pub enum SetupMsg {
     Msg0(Msg0),
+    Msg1(Msg1),
 }
 
 impl SetupMsg {
@@ -41,11 +44,19 @@ impl SetupMsg {
             Err(self)
         }
     }
+
+    pub fn try_into_msg1(self) -> Result<Msg1, Self> {
+        if let Self::Msg1(v) = self {
+            Ok(v)
+        } else {
+            Err(self)
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Msg0 {
-    pub lock_psbt: PartiallySignedTransaction,
+    pub lock_psbt: PartiallySignedTransaction, // TODO: Use binary representation
     pub identity_pk: PublicKey,
     #[serde(with = "bdk::bitcoin::util::amount::serde::as_sat")]
     pub lock_amount: Amount,
@@ -101,5 +112,26 @@ impl From<Msg0> for (PartyParams, PunishParams) {
         };
 
         (party, punish)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Msg1 {
+    pub commit: EcdsaAdaptorSignature,
+    pub cets: Vec<(Txid, EcdsaAdaptorSignature)>,
+    pub refund: Signature,
+}
+
+impl From<CfdTransactions> for Msg1 {
+    fn from(txs: CfdTransactions) -> Self {
+        Self {
+            commit: txs.commit.1,
+            cets: txs
+                .cets
+                .into_iter()
+                .map(|(tx, sig, _, _)| (tx.txid(), sig))
+                .collect(),
+            refund: txs.refund.1,
+        }
     }
 }

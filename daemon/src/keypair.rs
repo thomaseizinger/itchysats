@@ -1,4 +1,4 @@
-use bdk::bitcoin::self;
+use bdk::bitcoin;
 use bdk::bitcoin::secp256k1::{self, SECP256K1};
 use rand::{CryptoRng, RngCore};
 

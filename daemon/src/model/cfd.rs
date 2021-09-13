@@ -33,7 +33,8 @@ pub struct CfdOffer {
 
     pub price: Usd,
 
-    // TODO: [post-MVP] Representation of the contract size; at the moment the contract size is always 1 USD
+    // TODO: [post-MVP] Representation of the contract size; at the moment the contract size is
+    // always 1 USD
     pub min_quantity: Usd,
     pub max_quantity: Usd,
 
@@ -120,7 +121,8 @@ pub struct CfdTakeRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CfdNewOfferRequest {
     pub price: Usd,
-    // TODO: [post-MVP] Representation of the contract size; at the moment the contract size is always 1 USD
+    // TODO: [post-MVP] Representation of the contract size; at the moment the contract size is
+    // always 1 USD
     pub min_quantity: Usd,
     pub max_quantity: Usd,
 }
@@ -183,7 +185,8 @@ pub enum CfdState {
     ///
     /// This state applies to taker and maker.
     CloseRequested { common: CfdStateCommon },
-    /// The close transaction (CET) was published on the Bitcoin blockchain but we don't have a confirmation yet.
+    /// The close transaction (CET) was published on the Bitcoin blockchain but we don't have a
+    /// confirmation yet.
     ///
     /// This state applies to taker and maker.
     PendingClose { common: CfdStateCommon },
@@ -334,7 +337,8 @@ mod tests {
     #[test]
     fn serialize_cfd_state_snapshot() {
         // This test is to prevent us from breaking the cfd_state API used by the UI and database!
-        // We serialize the state into the database, so changes to the enum result in breaking program version changes.
+        // We serialize the state into the database, so changes to the enum result in breaking
+        // program version changes.
 
         let fixed_timestamp = UNIX_EPOCH;
 
