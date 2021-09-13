@@ -213,7 +213,7 @@ fn build_cfds(
 
             let encsig = cet.encsign(identity_sk, &oracle_pk, &nonce_pk)?;
 
-            Ok((cet.inner, encsig, message))
+            Ok((cet.inner, encsig, message, nonce_pk))
         })
         .collect::<Result<Vec<_>>>()
         .context("cannot build and sign all cets")?;
@@ -425,7 +425,12 @@ pub struct PunishParams {
 pub struct CfdTransactions {
     pub lock: PartiallySignedTransaction,
     pub commit: (Transaction, EcdsaAdaptorSignature),
-    pub cets: Vec<(Transaction, EcdsaAdaptorSignature, Vec<u8>)>,
+    pub cets: Vec<(
+        Transaction,
+        EcdsaAdaptorSignature,
+        Vec<u8>,
+        schnorrsig::PublicKey,
+    )>,
     pub refund: (Transaction, Signature),
 }
 
