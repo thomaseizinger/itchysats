@@ -237,14 +237,14 @@ fn setup_contract(
             revocation: rev_sk,
             publish: publish_sk,
             lock: lock_tx,
-            commit: (commit_tx, msg1.commit),
+            commit: (commit_tx, *msg1.commit),
             cets: msg1
                 .cets
                 .into_iter()
                 .map(|(txid, sig)| {
                     let (cet, msg) = cet_by_id.remove(&txid).expect("unknown CET");
 
-                    (cet, sig, msg)
+                    (cet, *sig, msg)
                 })
                 .collect::<Vec<_>>(),
             refund: (refund_tx, msg1.refund),

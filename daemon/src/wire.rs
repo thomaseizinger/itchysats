@@ -4,8 +4,22 @@ use crate::CfdOffer;
 use bdk::bitcoin::secp256k1::Signature;
 use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
 use bdk::bitcoin::{Address, Amount, PublicKey, Txid};
-use cfd_protocol::{CfdTransactions, EcdsaAdaptorSignature, PartyParams, PunishParams};
+use cfd_protocol::{CfdTransactions, PartyParams, PunishParams};
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
+use serde_with::DisplayFromStr;
+
+#[serde_as]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdaptorSignature(#[serde_as(as = "DisplayFromStr")] cfd_protocol::EcdsaAdaptorSignature);
+
+impl std::ops::Deref for AdaptorSignature {
+    type Target = cfd_protocol::EcdsaAdaptorSignature;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -117,19 +131,19 @@ impl From<Msg0> for (PartyParams, PunishParams) {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Msg1 {
-    pub commit: EcdsaAdaptorSignature,
-    pub cets: Vec<(Txid, EcdsaAdaptorSignature)>,
+    pub commit: AdaptorSignature,
+    pub cets: Vec<(Txid, AdaptorSignature)>,
     pub refund: Signature,
 }
 
 impl From<CfdTransactions> for Msg1 {
     fn from(txs: CfdTransactions) -> Self {
         Self {
-            commit: txs.commit.1,
+            commit: AdaptorSignature(txs.commit.1),
             cets: txs
                 .cets
                 .into_iter()
-                .map(|(tx, sig, _, _)| (tx.txid(), sig))
+                .map(|(tx, sig, _, _)| (tx.txid(), AdaptorSignature(sig)))
                 .collect(),
             refund: txs.refund.1,
         }
