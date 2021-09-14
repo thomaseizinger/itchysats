@@ -32,7 +32,7 @@ pub fn new(
                 Ok(wire::MakerToTaker::InvalidOfferId(_)) => {
                     todo!()
                 }
-                Ok(wire::MakerToTaker::SetupContract(msg)) => {
+                Ok(wire::MakerToTaker::Protocol(msg)) => {
                     cfd_actor
                         .send(taker_cfd_actor::Command::IncProtocolMsg(msg))
                         .unwrap();

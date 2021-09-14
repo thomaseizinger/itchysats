@@ -6,8 +6,7 @@ use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
 use bdk::bitcoin::{Address, Amount, PublicKey, Txid};
 use cfd_protocol::{CfdTransactions, PartyParams, PunishParams};
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
-use serde_with::DisplayFromStr;
+use serde_with::{serde_as, DisplayFromStr};
 
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,7 +39,7 @@ pub enum MakerToTaker {
     // TODO: Needs RejectOffer as well
     ConfirmTakeOffer(CfdOfferId), // TODO: Include payout curve in "accept" message from maker
     InvalidOfferId(CfdOfferId),
-    SetupContract(SetupMsg),
+    Protocol(SetupMsg),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

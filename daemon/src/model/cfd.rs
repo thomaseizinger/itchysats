@@ -1,6 +1,9 @@
 use crate::model::{Leverage, Position, TradingPair, Usd};
 use anyhow::{Context, Result};
-use bdk::bitcoin::Amount;
+use bdk::bitcoin::secp256k1::{SecretKey, Signature};
+use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
+use bdk::bitcoin::{Amount, Transaction};
+use cfd_protocol::EcdsaAdaptorSignature;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -442,4 +445,20 @@ mod tests {
             r#"{"type":"Error","payload":{"common":{"transition_timestamp":{"secs_since_epoch":0,"nanos_since_epoch":0}}}}"#
         );
     }
+}
+
+/// Contains all data we've assembled about the CFD through the setup protocol.
+///
+/// All contained signatures are the signatures of THE OTHER PARTY.
+/// To use any of these transactions, we need to re-sign them with the correct secret key.
+#[derive(Debug)]
+pub struct FinalizedCfd {
+    pub identity: SecretKey,
+    pub revocation: SecretKey,
+    pub publish: SecretKey,
+
+    pub lock: PartiallySignedTransaction,
+    pub commit: (Transaction, EcdsaAdaptorSignature),
+    pub cets: Vec<(Transaction, EcdsaAdaptorSignature, Vec<u8>)>,
+    pub refund: (Transaction, Signature),
 }

@@ -1,14 +1,14 @@
-use crate::model::cfd::{Cfd, CfdOffer, CfdOfferId, CfdState, CfdStateCommon};
+use crate::model::cfd::{Cfd, CfdOffer, CfdOfferId, CfdState, CfdStateCommon, FinalizedCfd};
 use crate::model::Usd;
 use crate::wire::{Msg0, Msg1, SetupMsg};
 use crate::{db, wire};
-use bdk::bitcoin::secp256k1::{schnorrsig, SecretKey, Signature};
-use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
-use bdk::bitcoin::{self, Amount, Transaction};
+use bdk::bitcoin::secp256k1::{schnorrsig, SecretKey};
+
+use bdk::bitcoin::{self, Amount};
 use bdk::database::BatchDatabase;
 use cfd_protocol::{
-    commit_descriptor, create_cfd_transactions, lock_descriptor, EcdsaAdaptorSignature,
-    PartyParams, PunishParams, WalletExt,
+    commit_descriptor, create_cfd_transactions, lock_descriptor, PartyParams, PunishParams,
+    WalletExt,
 };
 use core::panic;
 use futures::Future;
@@ -146,22 +146,6 @@ where
     };
 
     (actor, sender)
-}
-
-/// Contains all data we've assembled about the CFD through the setup protocol.
-///
-/// All contained signatures are the signatures of THE OTHER PARTY.
-/// To use any of these transactions, we need to re-sign them with the correct secret key.
-#[derive(Debug)]
-pub struct FinalizedCfd {
-    pub identity: SecretKey,
-    pub revocation: SecretKey,
-    pub publish: SecretKey,
-
-    pub lock: PartiallySignedTransaction,
-    pub commit: (Transaction, EcdsaAdaptorSignature),
-    pub cets: Vec<(Transaction, EcdsaAdaptorSignature, Vec<u8>)>,
-    pub refund: (Transaction, Signature),
 }
 
 /// Given an initial set of parameters, sets up the CFD contract with the maker.
