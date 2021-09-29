@@ -3,7 +3,7 @@ use rocket::http::Status;
 use rocket::outcome::{try_outcome, IntoOutcome};
 use rocket::request::{FromRequest, Outcome};
 use rocket::{Request, State};
-use rocket_basicauth::{BasicAuth, BasicAuthError};
+use rocket_basicauth::BasicAuth;
 use std::fmt;
 use std::str::FromStr;
 
@@ -11,17 +11,6 @@ use std::str::FromStr;
 pub struct Authenticated {}
 
 pub const MAKER_USERNAME: &str = "maker";
-
-#[derive(Debug)]
-pub enum Error {
-    UnknownUser(String),
-    BadPassword,
-    InvalidEncoding(FromHexError),
-    BadBasicAuthHeader(BasicAuthError),
-    /// The auth password was not configured in Rocket's state.
-    MissingPassword,
-    NoAuthHeader,
-}
 
 #[derive(PartialEq)]
 pub struct Password([u8; 32]);
@@ -51,34 +40,45 @@ impl FromStr for Password {
 
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for Authenticated {
-    type Error = Error;
+    type Error = ();
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let basic_auth = try_outcome!(req
             .guard::<BasicAuth>()
             .await
-            .map_failure(|(status, error)| (status, Error::BadBasicAuthHeader(error)))
-            .forward_then(|()| Outcome::Failure((Status::Unauthorized, Error::NoAuthHeader))));
-        let password = try_outcome!(req
-            .guard::<&'r State<Password>>()
-            .await
-            .map_failure(|(status, _)| (status, Error::MissingPassword)));
+            .map_failure(|(status, error)| (status, {
+                tracing::warn!("Bad basic auth header: {:?}", error);
+            }))
+            .forward_then(|()| Outcome::Failure((Status::Unauthorized, {
+                tracing::warn!("No auth header");
+            }))));
+        let expected_password =
+            try_outcome!(req
+                .guard::<&'r State<Password>>()
+                .await
+                .map_failure(|(status, _)| (status, {
+                    tracing::warn!("No password set in rocket state");
+                })));
 
         if basic_auth.username != MAKER_USERNAME {
-            return Outcome::Failure((
-                Status::Unauthorized,
-                Error::UnknownUser(basic_auth.username),
-            ));
+            tracing::warn!("Unknown user {}", basic_auth.username);
+
+            return Outcome::Failure((Status::Unauthorized, ()));
         }
 
-        if &try_outcome!(basic_auth
-            .password
-            .parse::<Password>()
-            .map_err(Error::InvalidEncoding)
-            .into_outcome(Status::BadRequest))
-            != password.inner()
-        {
-            return Outcome::Failure((Status::Unauthorized, Error::BadPassword));
+        let password = match basic_auth.password.parse::<Password>() {
+            Ok(password) => password,
+            Err(e) => {
+                tracing::warn!("Failed to decode password: {}", e);
+
+                return Outcome::Failure((Status::BadRequest, ()));
+            }
+        };
+
+        if password != expected_password.inner() {
+            tracing::warn!("Passwords don't match");
+
+            return Outcome::Failure((Status::Unauthorized, ()));
         }
 
         Outcome::Success(Authenticated {})
