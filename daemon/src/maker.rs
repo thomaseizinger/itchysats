@@ -219,7 +219,6 @@ async fn main() -> Result<()> {
                 routes_maker::get_health_check
             ],
         )
-        .register("/api", rocket::catchers![routes_maker::unauthorized])
         .mount(
             "/",
             rocket::routes![routes_maker::dist, routes_maker::index],
