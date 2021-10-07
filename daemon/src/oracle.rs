@@ -1,4 +1,4 @@
-use crate::actors::log_error;
+use crate::log_error;
 use crate::model::cfd::{Cfd, CfdState};
 use crate::model::OracleEventId;
 use anyhow::{Context, Result};
