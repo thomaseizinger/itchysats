@@ -71,19 +71,19 @@ pub struct TakerStreamMessage {
     pub item: Result<wire::TakerToMaker>,
 }
 
-pub struct Actor {
+pub struct Actor<O, M, T> {
     db: sqlx::SqlitePool,
     wallet: Wallet,
     oracle_pk: schnorrsig::PublicKey,
     cfd_feed_actor_inbox: watch::Sender<Vec<Cfd>>,
     order_feed_sender: watch::Sender<Option<Order>>,
     update_cfd_feed_sender: watch::Sender<UpdateCfdProposals>,
-    takers: Address<maker_inc_connections::Actor>,
+    takers: Address<T>,
     current_order_id: Option<OrderId>,
-    monitor_actor: Address<monitor::Actor<Actor>>,
+    monitor_actor: Address<M>,
     setup_state: SetupState,
     latest_announcements: Option<BTreeMap<OracleEventId, oracle::Announcement>>,
-    oracle_actor: Address<oracle::Actor<Actor, monitor::Actor<Actor>>>,
+    oracle_actor: Address<O>,
     // Maker needs to also store TakerId to be able to send a reply back
     current_pending_proposals: HashMap<OrderId, (UpdateCfdProposal, TakerId)>,
 }
@@ -96,7 +96,13 @@ enum SetupState {
     None,
 }
 
-impl Actor {
+impl<O, M, T> Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: sqlx::SqlitePool,
@@ -105,9 +111,9 @@ impl Actor {
         cfd_feed_actor_inbox: watch::Sender<Vec<Cfd>>,
         order_feed_sender: watch::Sender<Option<Order>>,
         update_cfd_feed_sender: watch::Sender<UpdateCfdProposals>,
-        takers: Address<maker_inc_connections::Actor>,
-        monitor_actor: Address<monitor::Actor<Actor>>,
-        oracle_actor: Address<oracle::Actor<Actor, monitor::Actor<Actor>>>,
+        takers: Address<T>,
+        monitor_actor: Address<M>,
+        oracle_actor: Address<O>,
     ) -> Self {
         Self {
             db,
@@ -695,84 +701,156 @@ impl Actor {
 }
 
 #[async_trait]
-impl Handler<AcceptOrder> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<AcceptOrder> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: AcceptOrder, ctx: &mut Context<Self>) {
         log_error!(self.handle_accept_order(msg.order_id, ctx))
     }
 }
 
 #[async_trait]
-impl Handler<RejectOrder> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<RejectOrder> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: RejectOrder, _ctx: &mut Context<Self>) {
         log_error!(self.handle_reject_order(msg.order_id))
     }
 }
 
 #[async_trait]
-impl Handler<AcceptSettlement> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<AcceptSettlement> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: AcceptSettlement, _ctx: &mut Context<Self>) {
         log_error!(self.handle_accept_settlement(msg.order_id))
     }
 }
 
 #[async_trait]
-impl Handler<RejectSettlement> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<RejectSettlement> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: RejectSettlement, _ctx: &mut Context<Self>) {
         log_error!(self.handle_reject_settlement(msg.order_id))
     }
 }
 
 #[async_trait]
-impl Handler<AcceptRollOver> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<AcceptRollOver> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: AcceptRollOver, _ctx: &mut Context<Self>) {
         log_error!(self.handle_accept_roll_over(msg.order_id))
     }
 }
 
 #[async_trait]
-impl Handler<RejectRollOver> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<RejectRollOver> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: RejectRollOver, _ctx: &mut Context<Self>) {
         log_error!(self.handle_reject_roll_over(msg.order_id))
     }
 }
 
 #[async_trait]
-impl Handler<Commit> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<Commit> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: Commit, _ctx: &mut Context<Self>) {
         log_error!(self.handle_commit(msg.order_id))
     }
 }
 
 #[async_trait]
-impl Handler<NewOrder> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<NewOrder> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: NewOrder, _ctx: &mut Context<Self>) {
         log_error!(self.handle_new_order(msg.price, msg.min_quantity, msg.max_quantity));
     }
 }
 
 #[async_trait]
-impl Handler<NewTakerOnline> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<NewTakerOnline> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: NewTakerOnline, _ctx: &mut Context<Self>) {
         log_error!(self.handle_new_taker_online(msg.id));
     }
 }
 
 #[async_trait]
-impl Handler<CfdSetupCompleted> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<CfdSetupCompleted> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: CfdSetupCompleted, _ctx: &mut Context<Self>) {
         log_error!(self.handle_cfd_setup_completed(msg.order_id, msg.dlc));
     }
 }
 
 #[async_trait]
-impl Handler<monitor::Event> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<monitor::Event> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: monitor::Event, _ctx: &mut Context<Self>) {
         log_error!(self.handle_monitoring_event(msg))
     }
 }
 
 #[async_trait]
-impl Handler<TakerStreamMessage> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<TakerStreamMessage> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: TakerStreamMessage, _ctx: &mut Context<Self>) -> KeepRunning {
         let TakerStreamMessage { taker_id, item } = msg;
         let msg = match item {
@@ -829,14 +907,26 @@ impl Handler<TakerStreamMessage> for Actor {
 }
 
 #[async_trait]
-impl Handler<oracle::Announcements> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<oracle::Announcements> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: oracle::Announcements, _ctx: &mut Context<Self>) {
         log_error!(self.handle_oracle_announcements(msg))
     }
 }
 
 #[async_trait]
-impl Handler<oracle::Attestation> for Actor {
+impl<O: 'static, M: 'static, T: 'static> Handler<oracle::Attestation> for Actor<O, M, T>
+where
+    O: xtra::Handler<oracle::MonitorEvent>,
+    M: xtra::Handler<monitor::StartMonitoring>,
+    T: xtra::Handler<maker_inc_connections::BroadcastOrder>
+        + xtra::Handler<maker_inc_connections::TakerMessage>,
+{
     async fn handle(&mut self, msg: oracle::Attestation, _ctx: &mut Context<Self>) {
         log_error!(self.handle_oracle_attestation(msg))
     }
@@ -887,4 +977,4 @@ impl Message for TakerStreamMessage {
     type Result = KeepRunning;
 }
 
-impl xtra::Actor for Actor {}
+impl<O: 'static, M: 'static, T: 'static> xtra::Actor for Actor<O, M, T> {}

@@ -41,13 +41,16 @@ pub enum ListenerMessage {
     },
 }
 
-pub struct Actor {
+pub struct Actor<C> {
     write_connections: HashMap<TakerId, Address<send_to_socket::Actor<wire::MakerToTaker>>>,
-    cfd_actor: Address<maker_cfd::Actor>,
+    cfd_actor: Address<C>,
 }
 
-impl Actor {
-    pub fn new(cfd_actor: Address<maker_cfd::Actor>) -> Self {
+impl<C> Actor<C>
+where
+    C: xtra::Handler<maker_cfd::TakerStreamMessage>,
+{
+    pub fn new(cfd_actor: Address<C>) -> Self {
         Self {
             write_connections: HashMap::new(),
             cfd_actor,
@@ -139,21 +142,30 @@ macro_rules! log_error {
 }
 
 #[async_trait]
-impl Handler<BroadcastOrder> for Actor {
+impl<C: 'static> Handler<BroadcastOrder> for Actor<C>
+where
+    C: xtra::Handler<maker_cfd::TakerStreamMessage>,
+{
     async fn handle(&mut self, msg: BroadcastOrder, _ctx: &mut Context<Self>) {
         log_error!(self.handle_broadcast_order(msg));
     }
 }
 
 #[async_trait]
-impl Handler<TakerMessage> for Actor {
+impl<C: 'static> Handler<TakerMessage> for Actor<C>
+where
+    C: xtra::Handler<maker_cfd::TakerStreamMessage>,
+{
     async fn handle(&mut self, msg: TakerMessage, _ctx: &mut Context<Self>) {
         log_error!(self.handle_taker_message(msg));
     }
 }
 
 #[async_trait]
-impl Handler<ListenerMessage> for Actor {
+impl<C: 'static> Handler<ListenerMessage> for Actor<C>
+where
+    C: xtra::Handler<maker_cfd::TakerStreamMessage>,
+{
     async fn handle(&mut self, msg: ListenerMessage, _ctx: &mut Context<Self>) -> KeepRunning {
         match msg {
             ListenerMessage::NewConnection { stream, address } => {
@@ -184,4 +196,4 @@ impl Message for ListenerMessage {
     type Result = KeepRunning;
 }
 
-impl xtra::Actor for Actor {}
+impl<C: 'static> xtra::Actor for Actor<C> {}
