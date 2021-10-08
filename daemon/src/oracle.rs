@@ -230,7 +230,12 @@ fn next_ids() -> Vec<OracleEventId> {
         .collect()
 }
 
-fn next_24_hours(datetime: OffsetDateTime) -> Vec<OffsetDateTime> {
+fn next_24_hours(_datetime: OffsetDateTime) -> Vec<OffsetDateTime> {
+    // TODO: remove this and use datetime that we pass in
+    // start time: Thu Oct 07 2021 23:00:00 GMT+0000
+    // 2021-10-08T03:00:00 is within that, i.e. 4 hours later
+    let datetime = OffsetDateTime::from_unix_timestamp(1633654800).unwrap();
+
     let adjusted = datetime.replace_time(Time::from_hms(datetime.hour(), 0, 0).expect("in_range"));
     (1..=24).map(|i| adjusted + Duration::hours(i)).collect()
 }
@@ -238,10 +243,15 @@ fn next_24_hours(datetime: OffsetDateTime) -> Vec<OffsetDateTime> {
 #[allow(dead_code)]
 pub fn next_announcement_after(timestamp: OffsetDateTime) -> OracleEventId {
     // always ceil to next hour
-    let adjusted =
-        timestamp.replace_time(Time::from_hms(timestamp.hour() + 1, 0, 0).expect("in_range"));
+    // let adjusted =
+    //     timestamp.replace_time(Time::from_hms(timestamp.hour() + 1, 0, 0).expect("in_range"));
+    //
+    // event_id(adjusted)
+    //
 
-    event_id(adjusted)
+    // TODO: remove and use code above
+    // Use fixed past event so we can test CETs
+    OracleEventId("/x/BitMEX/BXBT/2021-10-08T03:00:00.price?n=20".to_string())
 }
 
 /// Construct the URL of `olivia`'s `BitMEX/BXBT` event to be attested
