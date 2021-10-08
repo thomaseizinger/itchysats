@@ -541,7 +541,7 @@ impl Cfd {
     const REFUND_THRESHOLD: f32 = 1.5;
 
     #[allow(dead_code)]
-    pub const CET_TIMELOCK: u32 = 12;
+    pub const CET_TIMELOCK: u32 = 1;
 
     pub fn handle(&mut self, event: CfdStateChangeEvent) -> Result<Option<CfdState>> {
         use CfdState::*;
