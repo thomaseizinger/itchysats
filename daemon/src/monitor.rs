@@ -267,12 +267,37 @@ where
             self.awaiting_status.len()
         );
 
+        let txid_to_script = self
+            .awaiting_status
+            .keys()
+            .cloned()
+            .collect::<HashMap<_, _>>();
+
         let histories = self
             .client
             .batch_script_get_history(self.awaiting_status.keys().map(|(_, script)| script))
             .context("Failed to get script histories")?;
 
-        self.update_state(latest_block_height, histories).await?;
+        let mut histories_grouped_by_txid = HashMap::new();
+        for history in histories {
+            for response in history {
+                let txid = response.tx_hash;
+                let script = match txid_to_script.get(&txid) {
+                    None => {
+                        tracing::error!(
+                            "Could not find script in own state for txid {}, ignoring",
+                            txid
+                        );
+                        continue;
+                    }
+                    Some(script) => script,
+                };
+                histories_grouped_by_txid.insert((txid, script.clone()), response);
+            }
+        }
+
+        self.update_state(latest_block_height, histories_grouped_by_txid)
+            .await?;
 
         Ok(())
     }
@@ -288,7 +313,7 @@ where
     async fn update_state(
         &mut self,
         latest_block_height: BlockHeight,
-        histories: Vec<Vec<GetHistoryRes>>,
+        histories: HashMap<(Txid, Script), GetHistoryRes>,
     ) -> Result<()> {
         if latest_block_height > self.latest_block_height {
             tracing::debug!(
@@ -298,30 +323,29 @@ where
             self.latest_block_height = latest_block_height;
         }
 
-        // 1. shape response into local data format
-        let new_status = histories.into_iter().zip(self.awaiting_status.keys().cloned()).map(|(script_history, (txid, script))| {
-            let new_script_status = match script_history.as_slice() {
-                [] => ScriptStatus::Unseen,
-                [remaining @ .., last] => {
-                    if !remaining.is_empty() {
-                        tracing::warn!("Found more than a single history entry for script. This is highly unexpected and those history entries will be ignored")
-                    }
-
-                    if last.height <= 0 {
-                        ScriptStatus::InMempool
-                    } else {
-                        ScriptStatus::Confirmed(
-                            Confirmed::from_inclusion_and_latest_block(
-                                u32::try_from(last.height).expect("we checked that height is > 0"),
+        // 1. Decide new status based on script history
+        let new_status = self
+            .awaiting_status
+            .iter()
+            .map(|(key, _old_status)| {
+                let new_script_status = match histories.get(key) {
+                    None => ScriptStatus::Unseen,
+                    Some(history_entry) => {
+                        if history_entry.height <= 0 {
+                            ScriptStatus::InMempool
+                        } else {
+                            ScriptStatus::Confirmed(Confirmed::from_inclusion_and_latest_block(
+                                u32::try_from(history_entry.height)
+                                    .expect("we checked that height is > 0"),
                                 u32::from(self.latest_block_height),
-                            ),
-                        )
+                            ))
+                        }
                     }
-                }
-            };
+                };
 
-            ((txid, script), new_script_status)
-        }).collect::<BTreeMap<_, _>>();
+                (key.clone(), new_script_status)
+            })
+            .collect::<BTreeMap<_, _>>();
 
         // 2. log any changes since our last sync
         for ((txid, script), status) in new_status.iter() {
