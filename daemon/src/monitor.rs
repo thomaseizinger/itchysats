@@ -278,6 +278,7 @@ where
             .batch_script_get_history(self.awaiting_status.keys().map(|(_, script)| script))
             .context("Failed to get script histories")?;
 
+
         let mut histories_grouped_by_txid = HashMap::new();
         for history in histories {
             for response in history {
