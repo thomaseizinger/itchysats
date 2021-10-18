@@ -179,7 +179,7 @@ pub async fn new(
     .context("Failed to send Msg2")?;
     let msg2 = stream
         .select_next_some()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
         .await
         .context("Expected Msg2 within 30 seconds")?
         .try_into_msg2()
