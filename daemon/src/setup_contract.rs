@@ -467,7 +467,7 @@ pub async fn roll_over(
         .select_next_some()
         .timeout(Duration::from_secs(60))
         .await
-        .context("Expected Msg2 within 30 seconds")?
+        .context("Expected Msg2 within 60 seconds")?
         .try_into_msg2()
         .context("Failed to read Msg2")?;
     let revocation_sk_theirs = msg2.revocation_sk;
