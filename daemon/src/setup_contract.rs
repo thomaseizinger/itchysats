@@ -54,9 +54,9 @@ pub async fn new(
         .context("Failed to send Msg0")?;
     let msg0 = stream
         .select_next_some()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(60))
         .await
-        .context("Expected Msg0 within 20 seconds")?
+        .context("Expected Msg0 within 60 seconds")?
         .try_into_msg0()
         .context("Failed to read Msg0")?;
 
@@ -179,9 +179,9 @@ pub async fn new(
     .context("Failed to send Msg2")?;
     let msg2 = stream
         .select_next_some()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
         .await
-        .context("Expected Msg2 within 30 seconds")?
+        .context("Expected Msg2 within 60 seconds")?
         .try_into_msg2()
         .context("Failed to read Msg2")?;
     signed_lock_tx
@@ -276,9 +276,9 @@ pub async fn roll_over(
     .context("Failed to send Msg0")?;
     let msg0 = stream
         .select_next_some()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(60))
         .await
-        .context("Expected Msg0 within 20 seconds")?
+        .context("Expected Msg0 within 60 seconds")?
         .try_into_msg0()
         .context("Failed to read Msg0")?;
 
@@ -465,9 +465,9 @@ pub async fn roll_over(
 
     let msg2 = stream
         .select_next_some()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
         .await
-        .context("Expected Msg2 within 30 seconds")?
+        .context("Expected Msg2 within 60 seconds")?
         .try_into_msg2()
         .context("Failed to read Msg2")?;
     let revocation_sk_theirs = msg2.revocation_sk;
