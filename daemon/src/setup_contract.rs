@@ -56,7 +56,7 @@ pub async fn new(
         .select_next_some()
         .timeout(Duration::from_secs(60))
         .await
-        .context("Expected Msg0 within 20 seconds")?
+        .context("Expected Msg0 within 60 seconds")?
         .try_into_msg0()
         .context("Failed to read Msg0")?;
 
