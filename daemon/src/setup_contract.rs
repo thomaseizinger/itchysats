@@ -130,13 +130,27 @@ pub async fn new(
 
     let commit_amount = Amount::from_sat(commit_tx.output[0].value);
 
+    for i in &own_cets {
+        for (tx, _sig, digits) in &i.cets {
+            let out0 = tx.output.get(0).map_or_else(|| 0, |out| out.value);
+            let out1 = tx.output.get(1).map_or_else(|| 0, |out| out.value);
+            tracing::debug!(
+                "txid: {} out0: {}, out1: {}, digits: {}",
+                tx.txid(),
+                out0,
+                out1,
+                digits
+            );
+        }
+    }
+
     verify_adaptor_signature(
-        &commit_tx,
-        &lock_desc,
-        lock_amount,
-        &msg1.commit,
-        &params.own_punish.publish_pk,
-        &params.other.identity_pk,
+        dbg!(&commit_tx),
+        dbg!(&lock_desc),
+        dbg!(lock_amount),
+        dbg!(&msg1.commit),
+        dbg!(&params.own_punish.publish_pk),
+        dbg!(&params.other.identity_pk),
     )
     .context("Commit adaptor signature does not verify")?;
 
