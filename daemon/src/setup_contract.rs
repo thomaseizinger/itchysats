@@ -94,6 +94,14 @@ pub async fn new(
 
     tracing::info!("Created CFD transactions");
 
+    for cets in &own_cfd_txs.cets {
+        for (tx, adapter_sig, digits) in &cets.cets {
+            dbg!(tx.txid());
+            dbg!(adapter_sig);
+            dbg!(digits);
+        }
+    }
+
     sink.send(SetupMsg::Msg1(Msg1::from(own_cfd_txs.clone())))
         .await
         .context("Failed to send Msg1")?;
@@ -130,23 +138,9 @@ pub async fn new(
 
     let commit_amount = Amount::from_sat(commit_tx.output[0].value);
 
-    for i in &own_cets {
-        for (tx, _sig, digits) in &i.cets {
-            let out0 = tx.output.get(0).map_or_else(|| 0, |out| out.value);
-            let out1 = tx.output.get(1).map_or_else(|| 0, |out| out.value);
-            tracing::debug!(
-                "txid: {} out0: {}, out1: {}, digits: {}",
-                tx.txid(),
-                out0,
-                out1,
-                digits
-            );
-        }
-    }
-
     verify_adaptor_signature(
         dbg!(&commit_tx),
-        dbg!(&lock_desc),
+        &lock_desc,
         dbg!(lock_amount),
         dbg!(&msg1.commit),
         dbg!(&params.own_punish.publish_pk),
