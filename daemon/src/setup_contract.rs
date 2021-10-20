@@ -97,6 +97,16 @@ pub async fn new(
     dbg!(&own_cfd_txs.commit.0);
     dbg!(own_cfd_txs.commit.1);
 
+    let lock_desc = lock_descriptor(params.maker().identity_pk, params.taker().identity_pk);
+    let lock_amount = params.maker().lock_amount + params.taker().lock_amount;
+
+    let commit_sighash = spending_tx_sighash(&own_cfd_txs.commit.0, &lock_desc, lock_amount);
+    dbg!(commit_sighash);
+    dbg!(params.maker_punish());
+    dbg!(params.taker_punish());
+
+    dbg!(sk);
+
     sink.send(SetupMsg::Msg1(Msg1::from(own_cfd_txs.clone())))
         .await
         .context("Failed to send Msg1")?;
@@ -110,10 +120,6 @@ pub async fn new(
         .context("Failed to read Msg1")?;
 
     tracing::info!("Exchanged CFD transactions");
-
-    let lock_desc = lock_descriptor(params.maker().identity_pk, params.taker().identity_pk);
-
-    let lock_amount = params.maker().lock_amount + params.taker().lock_amount;
 
     let commit_desc = commit_descriptor(
         (
