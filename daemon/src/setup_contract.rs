@@ -94,7 +94,7 @@ pub async fn new(
 
     tracing::info!("Created CFD transactions");
 
-    dbg!(own_cfd_txs.commit.0);
+    dbg!(&own_cfd_txs.commit.0);
     dbg!(own_cfd_txs.commit.1);
 
     sink.send(SetupMsg::Msg1(Msg1::from(own_cfd_txs.clone())))
