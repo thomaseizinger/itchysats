@@ -9,7 +9,7 @@ bdk = { version = "0.12", default-features = false }
 bit-vec = "0.6"
 itertools = "0.10"
 rand = "0.6"
-secp256k1-zkp = { git = "https://github.com/luckysori/rust-secp256k1-zkp", rev = "8129cb59d37798dcc0e00ff64476b83b3fa569dc", features = ["bitcoin_hashes", "global-context", "serde"] }
+secp256k1-zkp = { git = "https://github.com/luckysori/rust-secp256k1-zkp", rev = "9957e4f6d7960f3c8dae0f94d3f2b652f1ba716e", features = ["bitcoin_hashes", "global-context", "serde"] }
 thiserror = "1"
 
 [dev-dependencies]
