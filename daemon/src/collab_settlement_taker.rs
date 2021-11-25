@@ -1,16 +1,16 @@
 use crate::address_map::Stopping;
 use crate::model::cfd::{
-    Cfd, CollaborativeSettlement, OrderId, SettlementKind, SettlementProposal,
+    CfdAggregate, CollaborativeSettlement, OrderId, SettlementKind, SettlementProposal,
 };
 use crate::model::Price;
 use crate::{connection, projection, wire};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use xtra::prelude::MessageChannel;
 use xtra_productivity::xtra_productivity;
 
 pub struct Actor {
-    cfd: Cfd,
+    cfd: CfdAggregate,
     projection: xtra::Address<projection::Actor>,
     on_completed: Box<dyn MessageChannel<Completed>>,
     connection: xtra::Address<connection::Actor>,
@@ -19,14 +19,14 @@ pub struct Actor {
 
 impl Actor {
     pub fn new(
-        cfd: Cfd,
+        cfd: CfdAggregate,
         projection: xtra::Address<projection::Actor>,
         on_completed: impl MessageChannel<Completed> + 'static,
         current_price: Price,
         connection: xtra::Address<connection::Actor>,
         n_payouts: usize,
     ) -> Result<Self> {
-        let proposal = cfd.calculate_settlement(current_price, n_payouts)?;
+        let proposal = cfd.start_collaborative_settlement(current_price, n_payouts)?;
 
         Ok(Self {
             cfd,
@@ -38,14 +38,6 @@ impl Actor {
     }
 
     async fn propose(&mut self, this: xtra::Address<Self>) -> Result<()> {
-        if !self.cfd.is_collaborative_settle_possible() {
-            anyhow::bail!(
-                "Settlement proposal not possible because for cfd {} is in state {} which cannot be collaboratively settled",
-                self.cfd.order.id,
-                self.cfd.state
-            )
-        }
-
         self.connection
             .send(connection::ProposeSettlement {
                 timestamp: self.proposal.timestamp,
@@ -53,7 +45,7 @@ impl Actor {
                 maker: self.proposal.maker,
                 price: self.proposal.price,
                 address: this,
-                order_id: self.cfd.order.id,
+                order_id: self.cfd.id(),
             })
             .await??;
 
@@ -64,15 +56,17 @@ impl Actor {
     }
 
     async fn handle_confirmed(&mut self) -> Result<CollaborativeSettlement> {
-        let order_id = self.cfd.order.id;
+        let order_id = self.cfd.id();
 
         tracing::info!(%order_id, "Settlement proposal got accepted");
 
         self.update_proposal(None).await?;
 
-        let dlc = self.cfd.dlc().context("No DLC in CFD")?;
-
-        let (tx, sig) = dlc.close_transaction(&self.proposal)?;
+        // TODO: This should happen within a dedicated state machine returned from
+        // start_collaborative_settlement
+        let (tx, sig, payout_script_pubkey) = self
+            .cfd
+            .sign_collaborative_close_transaction(&self.proposal);
 
         // Need to use `do_send_async` here because this handler is called in
         // context of a message arriving over the wire, and would result in a
@@ -87,13 +81,13 @@ impl Actor {
 
         Ok(CollaborativeSettlement::new(
             tx,
-            dlc.script_pubkey_for(self.cfd.role()), // TODO: Hardcode role to Taker?
+            payout_script_pubkey,
             self.proposal.price,
         )?)
     }
 
     async fn handle_rejected(&mut self) -> Result<()> {
-        let order_id = self.cfd.order.id;
+        let order_id = self.cfd.id();
 
         tracing::info!(%order_id, "Settlement proposal got rejected");
 
@@ -108,7 +102,7 @@ impl Actor {
     ) -> Result<()> {
         self.projection
             .send(projection::UpdateSettlementProposal {
-                order: self.cfd.order.id,
+                order: self.cfd.id(),
                 proposal,
             })
             .await?;
@@ -131,7 +125,7 @@ impl xtra::Actor for Actor {
         if let Err(e) = self.propose(this).await {
             self.complete(
                 Completed::Failed {
-                    order_id: self.cfd.order.id,
+                    order_id: self.cfd.id(),
                     error: e,
                 },
                 ctx,
@@ -170,7 +164,7 @@ impl Actor {
         msg: wire::maker_to_taker::Settlement,
         ctx: &mut xtra::Context<Self>,
     ) {
-        let order_id = self.cfd.order.id;
+        let order_id = self.cfd.id();
 
         let completed = match msg {
             wire::maker_to_taker::Settlement::Confirm => match self.handle_confirmed().await {

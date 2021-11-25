@@ -4,8 +4,6 @@ use bdk::bitcoin::Amount;
 use bdk::{bitcoin, FeeRate};
 use clap::{Parser, Subcommand};
 use daemon::auth::{self, MAKER_USERNAME};
-use daemon::db::load_all_cfds;
-use daemon::model::cfd::Role;
 use daemon::model::WalletInfo;
 use daemon::seed::Seed;
 use daemon::tokio_ext::FutureExt;
@@ -277,9 +275,9 @@ async fn main() -> Result<()> {
         .await??;
 
     let cfds = {
-        let mut conn = db.acquire().await?;
+        let _conn = db.acquire().await?;
 
-        load_all_cfds(&mut conn).await?
+        vec![]
     };
 
     let (proj_actor, projection_feeds) =

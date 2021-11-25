@@ -1,9 +1,7 @@
-use crate::model::cfd::{Cfd, CfdState, Order, OrderId};
-use crate::model::BitMexPriceEventId;
-use anyhow::{bail, Context, Result};
+use crate::model::cfd::{Aggregate, CfdAggregate, CfdEvent, Event, OrderId};
+use anyhow::{Context, Result};
 use sqlx::pool::PoolConnection;
-use sqlx::{Sqlite, SqlitePool};
-use std::mem;
+use sqlx::{Acquire, Sqlite, SqlitePool};
 use time::Duration;
 
 pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -11,713 +9,232 @@ pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn insert_order(order: &Order, conn: &mut PoolConnection<Sqlite>) -> anyhow::Result<()> {
+pub async fn insert_cfd(cfd: &CfdAggregate, conn: &mut PoolConnection<Sqlite>) -> Result<()> {
     let query_result = sqlx::query(
-        r#"insert into orders (
+        r#"
+        insert into cfds (
             uuid,
-            trading_pair,
             position,
             initial_price,
-            min_quantity,
-            max_quantity,
             leverage,
-            liquidation_price,
-            creation_timestamp_seconds,
-            settlement_time_interval_seconds,
-            origin,
-            oracle_event_id
-        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#,
+            settlement_time_interval_hours,
+            quantity_usd,
+            counterparty_network_identity,
+            role
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8)"#,
     )
-    .bind(&order.id)
-    .bind(&order.trading_pair)
-    .bind(&order.position)
-    .bind(&order.price)
-    .bind(&order.min_quantity)
-    .bind(&order.max_quantity)
-    .bind(&order.leverage)
-    .bind(&order.liquidation_price)
-    .bind(&order.creation_timestamp.seconds())
-    .bind(&order.settlement_interval.whole_seconds())
-    .bind(&order.origin)
-    .bind(&order.oracle_event_id)
+    .bind(&cfd.id())
+    .bind(&cfd.position())
+    .bind(&cfd.initial_price())
+    .bind(&cfd.leverage())
+    .bind(&cfd.settlement_time_interval_hours().whole_hours())
+    .bind(&cfd.quantity())
+    .bind(&cfd.counterparty_network_identity())
     .execute(conn)
     .await?;
 
     if query_result.rows_affected() != 1 {
-        anyhow::bail!("failed to insert order");
-    }
-
-    Ok(())
-}
-
-pub async fn load_order_by_id(
-    id: OrderId,
-    conn: &mut PoolConnection<Sqlite>,
-) -> anyhow::Result<Order> {
-    let row = sqlx::query!(
-        r#"
-        select
-            uuid as "uuid: crate::model::cfd::OrderId",
-            trading_pair as "trading_pair: crate::model::TradingPair",
-            position as "position: crate::model::Position",
-            initial_price as "initial_price: crate::model::Price",
-            min_quantity as "min_quantity: crate::model::Usd",
-            max_quantity as "max_quantity: crate::model::Usd",
-            leverage as "leverage: crate::model::Leverage",
-            liquidation_price as "liquidation_price: crate::model::Price",
-            creation_timestamp_seconds as "ts_secs: crate::model::Timestamp",
-            settlement_time_interval_seconds as "settlement_time_interval_secs: i64",
-            origin as "origin: crate::model::cfd::Origin",
-            oracle_event_id as "oracle_event_id: crate::model::BitMexPriceEventId"
-        from
-            orders
-        where
-            uuid = $1
-        "#,
-        id
-    )
-    .fetch_one(conn)
-    .await?;
-
-    Ok(Order {
-        id: row.uuid,
-        trading_pair: row.trading_pair,
-        position: row.position,
-        price: row.initial_price,
-        min_quantity: row.min_quantity,
-        max_quantity: row.max_quantity,
-        leverage: row.leverage,
-        liquidation_price: row.liquidation_price,
-        creation_timestamp: row.ts_secs,
-        settlement_interval: Duration::new(row.settlement_time_interval_secs, 0),
-        origin: row.origin,
-        oracle_event_id: row.oracle_event_id,
-    })
-}
-
-pub async fn insert_cfd(cfd: &Cfd, conn: &mut PoolConnection<Sqlite>) -> anyhow::Result<()> {
-    if load_cfd_by_order_id(cfd.order.id, conn).await.is_ok() {
-        bail!(
-            "Cannot insert cfd because there is already a cfd for order id {}",
-            cfd.order.id
-        )
-    }
-
-    let state = serde_json::to_string(&cfd.state)?;
-    let query_result = sqlx::query(
-        r#"
-        insert into cfds (
-            order_id,
-            order_uuid,
-            quantity_usd
-        )
-        select
-            id as order_id,
-            uuid as order_uuid,
-            $2 as quantity_usd
-        from orders
-        where uuid = $1;
-
-        insert into cfd_states (
-            cfd_id,
-            state
-        )
-        select
-            id as cfd_id,
-            $3 as state
-        from cfds
-        order by id desc limit 1;
-        "#,
-    )
-    .bind(&cfd.order.id)
-    .bind(&cfd.quantity_usd)
-    .bind(state)
-    .execute(conn)
-    .await?;
-
-    // Should be 2 because we insert into cfds and cfd_states
-    if query_result.rows_affected() != 2 {
         anyhow::bail!("failed to insert cfd");
     }
 
     Ok(())
 }
 
-pub async fn append_cfd_state(cfd: &Cfd, conn: &mut PoolConnection<Sqlite>) -> anyhow::Result<()> {
-    let cfd_id = load_cfd_id_by_order_uuid(cfd.order.id, conn).await?;
-    let current_state = load_latest_cfd_state(cfd_id, conn)
-        .await
-        .context("loading latest state failed")?;
-    let new_state = &cfd.state;
+/// Appends a series of events to the `events` table.
+///
+/// Implementation is sub-optimal because we need to use transactions. Ideally we would use
+/// multi-row inserts but they are unsupported with sqlx.
+pub async fn append_events(
+    events: impl IntoEvents,
+    conn: &mut PoolConnection<Sqlite>,
+) -> Result<()> {
+    let events = events.into_events();
 
-    if mem::discriminant(&current_state) == mem::discriminant(new_state) {
-        // Since we have states where we add information this happens quite frequently
-        tracing::trace!(
-            "Same state transition for cfd with order_id {}: {}",
-            cfd.order.id,
-            current_state
-        );
+    let mut transaction = conn.begin().await?;
+
+    for event in events {
+        let (event_name, event_data) = event.event.to_json();
+
+        let query_result = sqlx::query(
+            r#"
+        insert into events (
+            cfd_id,
+            name,
+            data,
+            created_at
+        ) values (
+            (select id from cfds where cfds.uuid = $1),
+            $2, $3, $4
+        )"#,
+        )
+        .bind(&event.id)
+        .bind(&event_name)
+        .bind(&event_data)
+        .bind(&event.timestamp)
+        .execute(&mut transaction)
+        .await?;
+
+        if query_result.rows_affected() != 1 {
+            anyhow::bail!("failed to insert event");
+        }
     }
 
-    let cfd_state = serde_json::to_string(new_state)?;
-
-    sqlx::query(
-        r#"
-        insert into cfd_states (
-            cfd_id,
-            state
-        ) values ($1, $2);
-        "#,
-    )
-    .bind(cfd_id)
-    .bind(cfd_state)
-    .execute(conn)
-    .await?;
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction")?;
 
     Ok(())
 }
 
-async fn load_cfd_id_by_order_uuid(
-    order_uuid: OrderId,
-    conn: &mut PoolConnection<Sqlite>,
-) -> anyhow::Result<i64> {
-    let cfd_id = sqlx::query!(
+/// Trait to make it more convenient to pass different types to `append_events`.
+pub trait IntoEvents {
+    fn into_events(self) -> Vec<Event>;
+}
+
+impl IntoEvents for Event {
+    fn into_events(self) -> Vec<Event> {
+        vec![self]
+    }
+}
+
+impl IntoEvents for Option<Event> {
+    fn into_events(self) -> Vec<Event> {
+        self.map(|e| vec![e]).unwrap_or_default()
+    }
+}
+
+impl IntoEvents for Vec<Event> {
+    fn into_events(self) -> Vec<Event> {
+        self
+    }
+}
+
+pub async fn load_cfd(id: OrderId, conn: &mut PoolConnection<Sqlite>) -> Result<CfdAggregate> {
+    let cfd_row = sqlx::query!(
         r#"
-        select
+            select
+                id as cfd_id,
+                uuid as "uuid: crate::model::cfd::OrderId",
+                position as "position: crate::model::Position",
+                initial_price as "initial_price: crate::model::Price",
+                leverage as "leverage: crate::model::Leverage",
+                settlement_time_interval_hours,
+                quantity_usd as "quantity_usd: crate::model::Usd",
+                counterparty_network_identity as "counterparty_network_identity: crate::model::Identity",
+                role as "role: crate::model::cfd::Role"
+            from
+                cfds
+            where
+                cfds.uuid = $1
+            "#,
             id
-        from cfds
-        where order_uuid = $1;
-        "#,
-        order_uuid
     )
-    .fetch_one(conn)
+    .fetch_one(&mut *conn)
     .await?;
 
-    let cfd_id = cfd_id.id.context("No cfd found")?;
+    let cfd = CfdAggregate::new(
+        cfd_row.uuid,
+        cfd_row.position,
+        cfd_row.initial_price,
+        cfd_row.leverage,
+        Duration::hours(cfd_row.settlement_time_interval_hours),
+        cfd_row.quantity_usd,
+        cfd_row.counterparty_network_identity,
+        cfd_row.role,
+    );
 
-    Ok(cfd_id)
-}
-
-async fn load_latest_cfd_state(
-    cfd_id: i64,
-    conn: &mut PoolConnection<Sqlite>,
-) -> anyhow::Result<CfdState> {
-    let latest_cfd_state = sqlx::query!(
+    let events = sqlx::query!(
         r#"
-        select
-            state
-        from cfd_states
-        where cfd_id = $1
-        order by id desc
-        limit 1;
-        "#,
-        cfd_id
-    )
-    .fetch_one(conn)
-    .await?;
-
-    let latest_cfd_state_in_db: CfdState = serde_json::from_str(latest_cfd_state.state.as_str())?;
-
-    Ok(latest_cfd_state_in_db)
-}
-
-pub async fn load_cfd_by_order_id(
-    order_id: OrderId,
-    conn: &mut PoolConnection<Sqlite>,
-) -> Result<Cfd> {
-    let row = sqlx::query!(
-        r#"
-        with ord as (
-            select
-                id as order_id,
-                uuid,
-                trading_pair,
-                position,
-                initial_price,
-                min_quantity,
-                max_quantity,
-                leverage,
-                liquidation_price,
-                creation_timestamp_seconds as ts_secs,
-                settlement_time_interval_seconds as settlement_time_interval_secs,
-                origin,
-                oracle_event_id
-            from orders
-        ),
-
-        cfd as (
-            select
-                ord.order_id,
-                id as cfd_id,
-                quantity_usd
-            from cfds
-                inner join ord on ord.order_id = cfds.order_id
-        ),
-
-        state as (
-            select
-                id as state_id,
-                cfd.order_id,
-                cfd.quantity_usd,
-                state
-            from cfd_states
-                inner join cfd on cfd.cfd_id = cfd_states.cfd_id
-            where id in (
-                select
-                    max(id) as id
-                from cfd_states
-                group by (cfd_id)
-            )
-        )
 
         select
-            ord.uuid as "uuid: crate::model::cfd::OrderId",
-            ord.trading_pair as "trading_pair: crate::model::TradingPair",
-            ord.position as "position: crate::model::Position",
-            ord.initial_price as "initial_price: crate::model::Price",
-            ord.min_quantity as "min_quantity: crate::model::Usd",
-            ord.max_quantity as "max_quantity: crate::model::Usd",
-            ord.leverage as "leverage: crate::model::Leverage",
-            ord.liquidation_price as "liquidation_price: crate::model::Price",
-            ord.ts_secs as "ts_secs: crate::model::Timestamp",
-            ord.settlement_time_interval_secs as "settlement_time_interval_secs: i64",
-            ord.origin as "origin: crate::model::cfd::Origin",
-            ord.oracle_event_id as "oracle_event_id: crate::model::BitMexPriceEventId",
-            state.quantity_usd as "quantity_usd: crate::model::Usd",
-            state.state
-
-        from ord
-            inner join state on state.order_id = ord.order_id
-
-        where ord.uuid = $1
-        "#,
-        order_id
+            name,
+            data,
+            created_at as "created_at: crate::model::Timestamp"
+        from
+            events
+        where
+            cfd_id = $1
+            "#,
+        cfd_row.cfd_id
     )
-    .fetch_one(conn)
+    .fetch_all(&mut *conn)
     .await?;
 
-    let order = Order {
-        id: row.uuid,
-        trading_pair: row.trading_pair,
-        position: row.position,
-        price: row.initial_price,
-        min_quantity: row.min_quantity,
-        max_quantity: row.max_quantity,
-        leverage: row.leverage,
-        liquidation_price: row.liquidation_price,
-        creation_timestamp: row.ts_secs,
-        settlement_interval: Duration::new(row.settlement_time_interval_secs, 0),
-        origin: row.origin,
-        oracle_event_id: row.oracle_event_id,
-    };
-
-    // TODO:
-    // still have the use of serde_json::from_str() here, which will be dealt with
-    // via https://github.com/comit-network/hermes/issues/290
-    Ok(Cfd {
-        order,
-        quantity_usd: row.quantity_usd,
-        state: serde_json::from_str(row.state.as_str())?,
-    })
-}
-
-/// Loads all CFDs with the latest state as the CFD state
-pub async fn load_all_cfds(conn: &mut PoolConnection<Sqlite>) -> anyhow::Result<Vec<Cfd>> {
-    let rows = sqlx::query!(
-        r#"
-        with ord as (
-            select
-                id as order_id,
-                uuid,
-                trading_pair,
-                position,
-                initial_price,
-                min_quantity,
-                max_quantity,
-                leverage,
-                liquidation_price,
-                creation_timestamp_seconds as ts_secs,
-                settlement_time_interval_seconds as settlement_time_interval_secs,
-                origin,
-                oracle_event_id
-            from orders
-        ),
-
-        cfd as (
-            select
-                ord.order_id,
-                id as cfd_id,
-                quantity_usd
-            from cfds
-                inner join ord on ord.order_id = cfds.order_id
-        ),
-
-        state as (
-            select
-                id as state_id,
-                cfd.order_id,
-                cfd.quantity_usd,
-                state
-            from cfd_states
-                inner join cfd on cfd.cfd_id = cfd_states.cfd_id
-            where id in (
-                select
-                    max(id) as id
-                from cfd_states
-                group by (cfd_id)
-            )
-        )
-
-        select
-            ord.uuid as "uuid: crate::model::cfd::OrderId",
-            ord.trading_pair as "trading_pair: crate::model::TradingPair",
-            ord.position as "position: crate::model::Position",
-            ord.initial_price as "initial_price: crate::model::Price",
-            ord.min_quantity as "min_quantity: crate::model::Usd",
-            ord.max_quantity as "max_quantity: crate::model::Usd",
-            ord.leverage as "leverage: crate::model::Leverage",
-            ord.liquidation_price as "liquidation_price: crate::model::Price",
-            ord.ts_secs as "ts_secs: crate::model::Timestamp",
-            ord.settlement_time_interval_secs as "settlement_time_interval_secs: i64",
-            ord.origin as "origin: crate::model::cfd::Origin",
-            ord.oracle_event_id as "oracle_event_id: crate::model::BitMexPriceEventId",
-            state.quantity_usd as "quantity_usd: crate::model::Usd",
-            state.state
-
-        from ord
-            inner join state on state.order_id = ord.order_id
-        "#
-    )
-    .fetch_all(conn)
-    .await?;
-
-    let cfds = rows
+    let events = events
         .into_iter()
-        .map(|row| {
-            let order = Order {
-                id: row.uuid,
-                trading_pair: row.trading_pair,
-                position: row.position,
-                price: row.initial_price,
-                min_quantity: row.min_quantity,
-                max_quantity: row.max_quantity,
-                leverage: row.leverage,
-                liquidation_price: row.liquidation_price,
-                creation_timestamp: row.ts_secs,
-                settlement_interval: Duration::new(row.settlement_time_interval_secs, 0),
-                origin: row.origin,
-                oracle_event_id: row.oracle_event_id,
-            };
+        .map(|event_row| {
+            let cfd_event = CfdEvent::from_json(event_row.name, event_row.data)?;
 
-            Ok(Cfd {
-                order,
-                quantity_usd: row.quantity_usd,
-                state: serde_json::from_str(row.state.as_str())?,
+            Ok(Event {
+                timestamp: event_row.created_at,
+                id,
+                event: cfd_event,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(cfds)
+    let cfd = events.into_iter().fold(cfd, |cfd, event| cfd.apply(&event));
+
+    Ok(cfd)
 }
 
-/// Loads all CFDs with the latest state as the CFD state
-pub async fn load_cfds_by_oracle_event_id(
-    oracle_event_id: BitMexPriceEventId,
-    conn: &mut PoolConnection<Sqlite>,
-) -> anyhow::Result<Vec<Cfd>> {
-    let event_id = oracle_event_id.to_string();
-    let rows = sqlx::query!(
+pub async fn load_all_cfds(conn: &mut PoolConnection<Sqlite>) -> Result<Vec<CfdAggregate>> {
+    let records = sqlx::query!(
         r#"
-        with ord as (
             select
-                id as order_id,
-                uuid,
-                trading_pair,
-                position,
-                initial_price,
-                min_quantity,
-                max_quantity,
-                leverage,
-                liquidation_price,
-                creation_timestamp_seconds as ts_secs,
-                settlement_time_interval_seconds as settlement_time_interval_secs,
-                origin,
-                oracle_event_id
-            from orders
-        ),
-
-        cfd as (
-            select
-                ord.order_id,
-                id as cfd_id,
-                quantity_usd
-            from cfds
-                inner join ord on ord.order_id = cfds.order_id
-        ),
-
-        state as (
-            select
-                id as state_id,
-                cfd.order_id,
-                cfd.quantity_usd,
-                state
-            from cfd_states
-                inner join cfd on cfd.cfd_id = cfd_states.cfd_id
-            where id in (
-                select
-                    max(id) as id
-                from cfd_states
-                group by (cfd_id)
-            )
-        )
-
-        select
-            ord.uuid as "uuid: crate::model::cfd::OrderId",
-            ord.trading_pair as "trading_pair: crate::model::TradingPair",
-            ord.position as "position: crate::model::Position",
-            ord.initial_price as "initial_price: crate::model::Price",
-            ord.min_quantity as "min_quantity: crate::model::Usd",
-            ord.max_quantity as "max_quantity: crate::model::Usd",
-            ord.leverage as "leverage: crate::model::Leverage",
-            ord.liquidation_price as "liquidation_price: crate::model::Price",
-            ord.ts_secs as "ts_secs: crate::model::Timestamp",
-            ord.settlement_time_interval_secs as "settlement_time_interval_secs: i64",
-            ord.origin as "origin: crate::model::cfd::Origin",
-            ord.oracle_event_id as "oracle_event_id: crate::model::BitMexPriceEventId",
-            state.quantity_usd as "quantity_usd: crate::model::Usd",
-            state.state
-
-        from ord
-            inner join state on state.order_id = ord.order_id
-
-        where ord.oracle_event_id = $1
-        "#,
-        event_id
+                uuid as "uuid: crate::model::cfd::OrderId"
+            from
+                cfds
+            "#
     )
-    .fetch_all(conn)
+    .fetch_all(&mut *conn)
     .await?;
 
-    let cfds = rows
-        .into_iter()
-        .map(|row| {
-            let order = Order {
-                id: row.uuid,
-                trading_pair: row.trading_pair,
-                position: row.position,
-                price: row.initial_price,
-                min_quantity: row.min_quantity,
-                max_quantity: row.max_quantity,
-                leverage: row.leverage,
-                liquidation_price: row.liquidation_price,
-                creation_timestamp: row.ts_secs,
-                settlement_interval: Duration::new(row.settlement_time_interval_secs, 0),
-                origin: row.origin,
-                oracle_event_id: row.oracle_event_id,
-            };
+    let mut cfds = Vec::with_capacity(records.len());
 
-            Ok(Cfd {
-                order,
-                quantity_usd: row.quantity_usd,
-                state: serde_json::from_str(row.state.as_str())?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    for record in records {
+        cfds.push(load_cfd(record.uuid, &mut *conn).await?)
+    }
 
     Ok(cfds)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::model::{Leverage, Position, Price, Usd};
     use pretty_assertions::assert_eq;
-    use rand::Rng;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
-    use time::macros::datetime;
-    use time::OffsetDateTime;
-
-    use crate::db::insert_order;
-    use crate::model::cfd::{Cfd, CfdState, Order, Origin};
-    use crate::model::{Price, Usd};
 
     use super::*;
-
-    #[tokio::test]
-    async fn test_insert_and_load_order() {
-        let mut conn = setup_test_db().await;
-
-        let order = Order::dummy().insert(&mut conn).await;
-        let loaded = load_order_by_id(order.id, &mut conn).await.unwrap();
-
-        assert_eq!(order, loaded);
-    }
+    use crate::model::cfd::Role;
 
     #[tokio::test]
     async fn test_insert_and_load_cfd() {
         let mut conn = setup_test_db().await;
 
-        let cfd = Cfd::dummy().insert(&mut conn).await;
-        let loaded = load_all_cfds(&mut conn).await.unwrap();
+        let cfd = CfdAggregate::dummy().insert(&mut conn).await;
+        let loaded = load_cfd(cfd.id(), &mut conn).await.unwrap();
 
-        assert_eq!(vec![cfd], loaded);
+        assert_eq!(cfd, loaded);
     }
 
     #[tokio::test]
-    async fn test_insert_and_load_cfd_by_order_id() {
+    async fn saved_events_are_applied_to_loaded_cfd() {
         let mut conn = setup_test_db().await;
 
-        let cfd = Cfd::dummy().insert(&mut conn).await;
-        let loaded = load_cfd_by_order_id(cfd.order.id, &mut conn).await.unwrap();
+        let cfd = CfdAggregate::dummy().insert(&mut conn).await;
+        append_events(
+            vec![Event::new(cfd.id(), CfdEvent::OfferRejected)],
+            &mut conn,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(cfd, loaded)
-    }
+        let loaded = load_cfd(cfd.id(), &mut conn).await.unwrap();
 
-    #[tokio::test]
-    async fn test_insert_and_load_cfd_by_order_id_multiple() {
-        let mut conn = setup_test_db().await;
-
-        let cfd1 = Cfd::dummy().insert(&mut conn).await;
-        let cfd2 = Cfd::dummy().insert(&mut conn).await;
-
-        let loaded_1 = load_cfd_by_order_id(cfd1.order.id, &mut conn)
-            .await
-            .unwrap();
-        let loaded_2 = load_cfd_by_order_id(cfd2.order.id, &mut conn)
-            .await
-            .unwrap();
-
-        assert_eq!(cfd1, loaded_1);
-        assert_eq!(cfd2, loaded_2);
-    }
-
-    #[tokio::test]
-    async fn test_insert_and_load_cfd_by_oracle_event_id() {
-        let mut conn = setup_test_db().await;
-
-        let cfd_1 = Cfd::dummy()
-            .with_event_id(BitMexPriceEventId::event1())
-            .insert(&mut conn)
-            .await;
-        let cfd_2 = Cfd::dummy()
-            .with_event_id(BitMexPriceEventId::event1())
-            .insert(&mut conn)
-            .await;
-        let cfd_3 = Cfd::dummy()
-            .with_event_id(BitMexPriceEventId::event2())
-            .insert(&mut conn)
-            .await;
-
-        let cfds_event_1 = load_cfds_by_oracle_event_id(BitMexPriceEventId::event1(), &mut conn)
-            .await
-            .unwrap();
-
-        let cfds_event_2 = load_cfds_by_oracle_event_id(BitMexPriceEventId::event2(), &mut conn)
-            .await
-            .unwrap();
-
-        assert_eq!(vec![cfd_1, cfd_2], cfds_event_1);
-        assert_eq!(vec![cfd_3], cfds_event_2);
-    }
-
-    #[tokio::test]
-    async fn test_insert_new_cfd_state_and_load_with_multiple_cfd() {
-        let mut conn = setup_test_db().await;
-
-        let mut cfd_1 = Cfd::dummy().insert(&mut conn).await;
-
-        cfd_1.state = CfdState::accepted();
-        append_cfd_state(&cfd_1, &mut conn).await.unwrap();
-
-        let cfds_from_db = load_all_cfds(&mut conn).await.unwrap();
-        assert_eq!(vec![cfd_1.clone()], cfds_from_db);
-
-        let mut cfd_2 = Cfd::dummy().insert(&mut conn).await;
-
-        let cfds_from_db = load_all_cfds(&mut conn).await.unwrap();
-        assert_eq!(vec![cfd_1.clone(), cfd_2.clone()], cfds_from_db);
-
-        cfd_2.state = CfdState::rejected();
-        append_cfd_state(&cfd_2, &mut conn).await.unwrap();
-
-        let cfds_from_db = load_all_cfds(&mut conn).await.unwrap();
-        assert_eq!(vec![cfd_1, cfd_2], cfds_from_db);
-    }
-
-    #[tokio::test]
-    async fn test_insert_order_without_cfd_associates_with_correct_cfd() {
-        let mut conn = setup_test_db().await;
-
-        // Insert an order without a CFD
-        let _order_1 = Order::dummy().insert(&mut conn).await;
-
-        // Insert a CFD (this also inserts an order)
-        let cfd_1 = Cfd::dummy().insert(&mut conn).await;
-
-        let all_cfds = load_all_cfds(&mut conn).await.unwrap();
-
-        assert_eq!(all_cfds, vec![cfd_1]);
-    }
-
-    // test more data; test will add 100 cfds to the database, with each
-    // having a random number of random updates. Final results are deterministic.
-    #[tokio::test]
-    async fn test_multiple_cfd_updates_per_cfd() {
-        let mut conn = setup_test_db().await;
-
-        for i in 0..100 {
-            let mut cfd = Cfd::dummy()
-                .with_event_id(BitMexPriceEventId::event1())
-                .insert(&mut conn)
-                .await;
-
-            let n_updates = rand::thread_rng().gen_range(1, 30);
-
-            for _ in 0..n_updates {
-                cfd.state = random_simple_state();
-                append_cfd_state(&cfd, &mut conn).await.unwrap();
-            }
-
-            // verify current state is correct
-            let loaded_by_order_id = load_cfd_by_order_id(cfd.order.id, &mut conn).await.unwrap();
-            assert_eq!(loaded_by_order_id, cfd);
-
-            // load_cfds_by_oracle_event_id can return multiple CFDs
-            let loaded_by_oracle_event_id =
-                load_cfds_by_oracle_event_id(BitMexPriceEventId::event1(), &mut conn)
-                    .await
-                    .unwrap();
-            assert_eq!(loaded_by_oracle_event_id.len(), i + 1);
-        }
-
-        // verify query returns only one state per CFD
-        let data = load_all_cfds(&mut conn).await.unwrap();
-
-        assert_eq!(data.len(), 100);
-    }
-
-    #[tokio::test]
-    async fn inserting_two_cfds_with_same_order_id_should_fail() {
-        let mut conn = setup_test_db().await;
-
-        let cfd = Cfd::dummy().insert(&mut conn).await;
-
-        let error = insert_cfd(&cfd, &mut conn).await.err().unwrap();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "Cannot insert cfd because there is already a cfd for order id {}",
-                cfd.order.id
-            )
-        );
-    }
-
-    fn random_simple_state() -> CfdState {
-        match rand::thread_rng().gen_range(0, 5) {
-            0 => CfdState::outgoing_order_request(),
-            1 => CfdState::accepted(),
-            2 => CfdState::rejected(),
-            3 => CfdState::contract_setup(),
-            _ => CfdState::setup_failed(String::from("dummy failure")),
-        }
+        assert_eq!(loaded.version(), 1); // we applied 1 event
     }
 
     async fn setup_test_db() -> PoolConnection<Sqlite> {
@@ -728,55 +245,25 @@ mod tests {
         pool.acquire().await.unwrap()
     }
 
-    impl BitMexPriceEventId {
-        fn event1() -> Self {
-            BitMexPriceEventId::with_20_digits(datetime!(2021-10-13 10:00:00).assume_utc())
-        }
-
-        fn event2() -> Self {
-            BitMexPriceEventId::with_20_digits(datetime!(2021-10-25 18:00:00).assume_utc())
-        }
-    }
-
-    impl Cfd {
+    impl CfdAggregate {
         fn dummy() -> Self {
-            Cfd::new(
-                Order::dummy(),
-                Usd::new(dec!(1000)),
-                CfdState::outgoing_order_request(),
+            CfdAggregate::new(
+                OrderId::default(),
+                Position::Long,
+                Price::new(dec!(60_000)).unwrap(),
+                Leverage::new(2).unwrap(),
+                Duration::hours(24),
+                Usd::new(dec!(1_000)),
+                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+                    .parse()
+                    .unwrap(),
+                Role::Taker,
             )
         }
 
         /// Insert this [`Cfd`] into the database, returning the instance for further chaining.
         async fn insert(self, conn: &mut PoolConnection<Sqlite>) -> Self {
-            insert_order(&self.order, conn).await.unwrap();
             insert_cfd(&self, conn).await.unwrap();
-
-            self
-        }
-
-        fn with_event_id(mut self, id: BitMexPriceEventId) -> Self {
-            self.order.oracle_event_id = id;
-            self
-        }
-    }
-
-    impl Order {
-        fn dummy() -> Self {
-            Order::new(
-                Price::new(dec!(1000)).unwrap(),
-                Usd::new(dec!(100)),
-                Usd::new(dec!(1000)),
-                Origin::Theirs,
-                BitMexPriceEventId::with_20_digits(OffsetDateTime::now_utc()),
-                time::Duration::hours(24),
-            )
-            .unwrap()
-        }
-
-        /// Insert this [`Order`] into the database, returning the instance for further chaining.
-        async fn insert(self, conn: &mut PoolConnection<Sqlite>) -> Self {
-            insert_order(&self, conn).await.unwrap();
 
             self
         }

@@ -5,9 +5,9 @@ use crate::schnorrsig;
 use ::bdk::bitcoin::Network;
 use daemon::bitmex_price_feed::Quote;
 use daemon::connection::{connect, ConnectionStatus};
-use daemon::model::cfd::Role;
-use daemon::model::{self, Price, Timestamp, Usd};
-use daemon::projection::{Cfd, CfdOrder, Feeds, Identity};
+use daemon::model::cfd::Cfd;
+use daemon::model::{self, Identity, Price, Timestamp, Usd};
+use daemon::projection::{CfdOrder, Feeds};
 use daemon::seed::Seed;
 use daemon::{
     db, maker_cfd, maker_inc_connections, projection, taker_cfd, MakerActorSystem, Tasks,
@@ -293,6 +293,7 @@ impl Taker {
             config.heartbeat_timeout,
             Duration::from_secs(10),
             projection_actor,
+            Identity::new(maker_noise_pub_key),
         )
         .await
         .unwrap();

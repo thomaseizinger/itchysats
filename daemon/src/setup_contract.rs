@@ -2,11 +2,10 @@ use crate::model::cfd::{Cet, Dlc, RevokedCommit, Role};
 use crate::model::{Leverage, Price, Usd};
 use crate::tokio_ext::FutureExt;
 use crate::wire::{
-    Msg0, Msg1, Msg2, Msg3, RollOverMsg, RollOverMsg0, RollOverMsg1, RollOverMsg2, RollOverMsg3,
-    SetupMsg,
+    Msg0, Msg1, Msg2, RollOverMsg, RollOverMsg0, RollOverMsg1, RollOverMsg2, SetupMsg,
 };
 use crate::{model, oracle, payout_curve, wallet};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use bdk::bitcoin::secp256k1::{schnorrsig, Signature, SECP256K1};
 use bdk::bitcoin::util::psbt::PartiallySignedTransaction;
 use bdk::bitcoin::{Amount, PublicKey, Transaction};
@@ -67,7 +66,7 @@ pub async fn new(
     sign_channel: Box<dyn MessageChannel<wallet::Sign>>,
     role: Role,
     n_payouts: usize,
-) -> Result<Dlc> {
+) -> Result<Dlc, ContractSetupError> {
     let (sk, pk) = crate::keypair::new(&mut rand::thread_rng());
     let (rev_sk, rev_pk) = crate::keypair::new(&mut rand::thread_rng());
     let (publish_sk, publish_pk) = crate::keypair::new(&mut rand::thread_rng());
@@ -104,11 +103,13 @@ pub async fn new(
     let params = AllParams::new(own_params, own_punish, other, other_punish, role);
 
     if params.other.lock_amount != setup_params.counterparty_margin {
-        anyhow::bail!(
-            "Amounts sent by counterparty don't add up, expected margin {} but got {}",
-            setup_params.counterparty_margin,
-            params.other.lock_amount
-        )
+        return Err(ContractSetupError::FailedBeforeLockSignature {
+            source: anyhow!(
+                "Amounts sent by counterparty don't add up, expected margin {} but got {}",
+                setup_params.counterparty_margin,
+                params.other.lock_amount
+            ),
+        });
     }
 
     let settlement_event_id = announcement.id;
@@ -211,33 +212,6 @@ pub async fn new(
 
     tracing::info!("Verified all signatures");
 
-    let mut signed_lock_tx = sign_channel
-        .send(wallet::Sign { psbt: lock_tx })
-        .await
-        .context("Failed to send message to wallet actor")?
-        .context("Failed to sign transaction")?;
-    sink.send(SetupMsg::Msg2(Msg2 {
-        signed_lock: signed_lock_tx.clone(),
-    }))
-    .await
-    .context("Failed to send Msg2")?;
-    let msg2 = stream
-        .select_next_some()
-        .timeout(Duration::from_secs(60))
-        .await
-        .context("Expected Msg2 within 60 seconds")?
-        .try_into_msg2()
-        .context("Failed to read Msg2")?;
-    signed_lock_tx
-        .merge(msg2.signed_lock)
-        .context("Failed to merge lock PSBTs")?;
-
-    tracing::info!("Exchanged signed lock transaction");
-
-    // TODO: In case we sign+send but never receive (the signed lock_tx from the other party) we
-    // need some fallback handling (after x time) to spend the outputs in a different way so the
-    // other party cannot hold us hostage
-
     let cets = own_cets
         .into_iter()
         .map(|grouped_cets| {
@@ -274,20 +248,18 @@ pub async fn new(
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
-    // TODO: Remove send- and receiving ACK messages once we are able to handle incomplete DLC
-    // monitoring
-    sink.send(SetupMsg::Msg3(Msg3))
+    let mut signed_lock_tx = sign_channel
+        .send(wallet::Sign { psbt: lock_tx })
         .await
-        .context("Failed to send Msg3")?;
-    let _ = stream
-        .select_next_some()
-        .timeout(Duration::from_secs(60))
-        .await
-        .context("Expected Msg3 within 60 seconds")?
-        .try_into_msg3()
-        .context("Failed to read Msg3")?;
+        .context("Failed to send message to wallet actor")?
+        .context("Failed to sign transaction")?;
+    sink.send(SetupMsg::Msg2(Msg2 {
+        signed_lock: signed_lock_tx.clone(),
+    }))
+    .await
+    .context("Failed to send Msg2")?;
 
-    Ok(Dlc {
+    let incomplete_dlc = Dlc {
         identity: sk,
         identity_counterparty: params.other.identity_pk,
         revocation: rev_sk,
@@ -296,7 +268,7 @@ pub async fn new(
         publish_pk_counterparty: other_punish.publish_pk,
         maker_address: params.maker().address.clone(),
         taker_address: params.taker().address.clone(),
-        lock: (signed_lock_tx.extract_tx(), lock_desc),
+        lock: (signed_lock_tx.clone().extract_tx(), lock_desc.clone()),
         commit: (commit_tx, msg1.commit, commit_desc),
         cets,
         refund: (refund_tx, msg1.refund),
@@ -304,7 +276,51 @@ pub async fn new(
         taker_lock_amount: params.taker().lock_amount,
         revoked_commit: Vec::new(),
         settlement_event_id,
+        refund_timelock: setup_params.refund_timelock,
+    };
+
+    let msg2 = stream
+        .select_next_some()
+        .timeout(Duration::from_secs(60))
+        .await
+        .context("Expected Msg2 within 60 seconds")?
+        .try_into_msg2()
+        .context("Failed to read Msg2")
+        .map_err(
+            |e| ContractSetupError::LockTransactionSignatureSentButNotReceived {
+                incomplete_dlc: incomplete_dlc.clone(),
+                source: e,
+            },
+        )?;
+
+    signed_lock_tx
+        .merge(msg2.signed_lock)
+        .context("Failed to merge lock PSBTs")
+        .map_err(
+            |e| ContractSetupError::LockTransactionSignatureSentButNotReceived {
+                incomplete_dlc: incomplete_dlc.clone(),
+                source: e,
+            },
+        )?;
+
+    Ok(Dlc {
+        lock: (signed_lock_tx.extract_tx(), lock_desc),
+        ..incomplete_dlc
     })
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ContractSetupError {
+    #[error("Contract setup failed, neither party is able to publish transactions")]
+    FailedBeforeLockSignature {
+        #[from]
+        source: anyhow::Error,
+    },
+    #[error("The contract setup finished in an incomplete state, unable to publish lock transaction but the other party may publish it")]
+    LockTransactionSignatureSentButNotReceived {
+        incomplete_dlc: Dlc,
+        source: anyhow::Error,
+    },
 }
 
 pub struct RolloverParams {
@@ -333,7 +349,7 @@ pub async fn roll_over(
     our_role: Role,
     dlc: Dlc,
     n_payouts: usize,
-) -> Result<Dlc> {
+) -> Result<Dlc, RolloverError> {
     let sk = dlc.identity;
     let pk = PublicKey::new(secp256k1_zkp::PublicKey::from_secret_key(SECP256K1, &sk));
 
@@ -382,7 +398,8 @@ pub async fn roll_over(
         .iter_mut()
         .for_each(|input| input.witness.clear());
 
-    let lock_tx = PartiallySignedTransaction::from_unsigned_tx(unsigned_lock_tx)?;
+    let lock_tx = PartiallySignedTransaction::from_unsigned_tx(unsigned_lock_tx)
+        .context("Unable to create partially signed transaction from unsigned tx")?;
     let other_punish_params = PunishParams {
         revocation_pk: msg0.revocation_pk,
         publish_pk: msg0.publish_pk,
@@ -545,49 +562,9 @@ pub async fn roll_over(
     .await
     .context("Failed to send Msg2")?;
 
-    let msg2 = stream
-        .select_next_some()
-        .timeout(Duration::from_secs(60))
-        .await
-        .context("Expected Msg2 within 60 seconds")?
-        .try_into_msg2()
-        .context("Failed to read Msg2")?;
-    let revocation_sk_theirs = msg2.revocation_sk;
-
-    {
-        let derived_rev_pk = PublicKey::new(secp256k1_zkp::PublicKey::from_secret_key(
-            SECP256K1,
-            &revocation_sk_theirs,
-        ));
-
-        if derived_rev_pk != dlc.revocation_pk_counterparty {
-            anyhow::bail!("Counterparty sent invalid revocation sk");
-        }
-    }
-
     let mut revoked_commit = dlc.revoked_commit;
-    revoked_commit.push(RevokedCommit {
-        encsig_ours: own_cfd_txs.commit.1,
-        revocation_sk_theirs,
-        publication_pk_theirs: dlc.publish_pk_counterparty,
-        txid: dlc.commit.0.txid(),
-        script_pubkey: dlc.commit.2.script_pubkey(),
-    });
 
-    // TODO: Remove send- and receiving ACK messages once we are able to handle incomplete DLC
-    // monitoring
-    sink.send(RollOverMsg::Msg3(RollOverMsg3))
-        .await
-        .context("Failed to send Msg3")?;
-    let _ = stream
-        .select_next_some()
-        .timeout(Duration::from_secs(60))
-        .await
-        .context("Expected Msg3 within 60 seconds")?
-        .try_into_msg3()
-        .context("Failed to read Msg3")?;
-
-    Ok(Dlc {
+    let incomplete_dlc = Dlc {
         identity: sk,
         identity_counterparty: dlc.identity_counterparty,
         revocation: rev_sk,
@@ -602,8 +579,49 @@ pub async fn roll_over(
         refund: (refund_tx, msg1.refund),
         maker_lock_amount,
         taker_lock_amount,
-        revoked_commit,
+        revoked_commit: revoked_commit.clone(),
         settlement_event_id: announcement.id,
+        refund_timelock: rollover_params.refund_timelock,
+    };
+
+    let msg2 = stream
+        .select_next_some()
+        .timeout(Duration::from_secs(60))
+        .await
+        .context("Expected Msg2 within 60 seconds")?
+        .try_into_msg2()
+        .context("Failed to read Msg2")
+        .map_err(|e| RolloverError::RevocationSignaturesSentButNotReceived {
+            incomplete_dlc: incomplete_dlc.clone(),
+            source: e,
+        })?;
+    let revocation_sk_theirs = msg2.revocation_sk;
+
+    {
+        let derived_rev_pk = PublicKey::new(secp256k1_zkp::PublicKey::from_secret_key(
+            SECP256K1,
+            &revocation_sk_theirs,
+        ));
+
+        if derived_rev_pk != dlc.revocation_pk_counterparty {
+            return Err(RolloverError::RevocationSignaturesSentButNotReceived {
+                incomplete_dlc: incomplete_dlc.clone(),
+                source: anyhow!("Counterparty sent invalid revocation sk"),
+            });
+        }
+    }
+
+    revoked_commit.push(RevokedCommit {
+        encsig_ours: own_cfd_txs.commit.1,
+        revocation_sk_theirs,
+        publication_pk_theirs: dlc.publish_pk_counterparty,
+        txid: dlc.commit.0.txid(),
+        script_pubkey: dlc.commit.2.script_pubkey(),
+    });
+
+    Ok(Dlc {
+        revoked_commit,
+        ..incomplete_dlc
     })
 }
 
@@ -746,4 +764,22 @@ fn verify_cet_encsig(
         &PublicKey::new(adaptor_point),
         pk,
     )
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RolloverError {
+    // TODO: What do we do if this error happens? Is the CFD remains open (i.e. rollover is just
+    // discarded)?
+    #[error("Rollover failed")]
+    FailedBeforeRevocationSignatures {
+        #[from]
+        source: anyhow::Error,
+    },
+    // TODO: What do we do if this error happens? Immediately send the commit tx of the new Dlc I
+    // suppose - because we don't have guarantees against the old state without the revoke commit.
+    #[error("The rollover finished in an incomplete state, unable to continue")]
+    RevocationSignaturesSentButNotReceived {
+        incomplete_dlc: Dlc,
+        source: anyhow::Error,
+    },
 }

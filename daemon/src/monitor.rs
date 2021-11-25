@@ -41,6 +41,8 @@ pub struct MonitorParams {
 
 pub struct Sync;
 
+// TODO: Send messages to the projection actor upon finality events so we send out updates.
+//  -> Might as well just send out all events independent of sending to the cfd actor.
 pub struct Actor<C = bdk::electrum_client::Client> {
     cfds: HashMap<OrderId, MonitorParams>,
     event_channel: Box<dyn StrongMessageChannel<Event>>,
@@ -78,12 +80,12 @@ impl Actor<bdk::electrum_client::Client> {
             match cfd.state.clone() {
                 // In PendingOpen we know the complete dlc setup and assume that the lock transaction will be published
                 CfdState::PendingOpen { dlc, .. } => {
-                    let params = MonitorParams::new(dlc.clone(), cfd.refund_timelock_in_blocks());
+                    let params = MonitorParams::new(dlc.clone());
                     actor.cfds.insert(cfd.order.id, params.clone());
                     actor.monitor_all(&params, cfd.order.id);
                 }
                 CfdState::Open { dlc, .. } | CfdState::PendingCommit { dlc, .. } => {
-                    let params = MonitorParams::new(dlc.clone(), cfd.refund_timelock_in_blocks());
+                    let params = MonitorParams::new(dlc.clone());
                     actor.cfds.insert(cfd.order.id, params.clone());
 
                     actor.monitor_commit_finality(&params, cfd.order.id);
@@ -99,7 +101,7 @@ impl Actor<bdk::electrum_client::Client> {
                     }
                 }
                 CfdState::OpenCommitted { dlc, cet_status, .. } => {
-                    let params = MonitorParams::new(dlc.clone(), cfd.refund_timelock_in_blocks());
+                    let params = MonitorParams::new(dlc.clone());
                     actor.cfds.insert(cfd.order.id, params.clone());
 
                     match cet_status {
@@ -126,7 +128,7 @@ impl Actor<bdk::electrum_client::Client> {
                     }
                 }
                 CfdState::PendingCet { dlc, attestation, .. } => {
-                    let params = MonitorParams::new(dlc.clone(), cfd.refund_timelock_in_blocks());
+                    let params = MonitorParams::new(dlc.clone());
                     actor.cfds.insert(cfd.order.id, params.clone());
 
                     actor.monitor_cet_finality(map_cets(dlc.cets), attestation.into(), cfd.order.id)?;
@@ -134,7 +136,7 @@ impl Actor<bdk::electrum_client::Client> {
                     actor.monitor_refund_finality(&params,cfd.order.id);
                 }
                 CfdState::PendingRefund { dlc, .. } => {
-                    let params = MonitorParams::new(dlc.clone(), cfd.refund_timelock_in_blocks());
+                    let params = MonitorParams::new(dlc.clone());
                     actor.cfds.insert(cfd.order.id, params.clone());
 
                     actor.monitor_commit_refund_timelock(&params, cfd.order.id);
@@ -561,17 +563,13 @@ impl Event {
 }
 
 impl MonitorParams {
-    pub fn new(dlc: Dlc, refund_timelock_in_blocks: u32) -> Self {
+    pub fn new(dlc: Dlc) -> Self {
         let script_pubkey = dlc.maker_address.script_pubkey();
         MonitorParams {
             lock: (dlc.lock.0.txid(), dlc.lock.1),
             commit: (dlc.commit.0.txid(), dlc.commit.2),
             cets: map_cets(dlc.cets),
-            refund: (
-                dlc.refund.0.txid(),
-                script_pubkey,
-                refund_timelock_in_blocks,
-            ),
+            refund: (dlc.refund.0.txid(), script_pubkey, dlc.refund_timelock),
             revoked_commits: dlc
                 .revoked_commit
                 .iter()

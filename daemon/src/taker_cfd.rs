@@ -1,20 +1,19 @@
 use crate::address_map::AddressMap;
-use crate::cfd_actors::{self, append_cfd_state, insert_cfd_and_send_to_feed};
-use crate::db::{insert_order, load_cfd_by_order_id, load_order_by_id};
+use crate::db::{append_events, insert_cfd, load_cfd};
 use crate::model::cfd::{
-    Cfd, CfdState, CfdStateCommon, Completed, Dlc, Order, OrderId, Origin, Role, RollOverProposal,
-    SettlementKind, UpdateCfdProposal, UpdateCfdProposals,
+    CfdAggregate, CfdEvent, Dlc, Order, OrderId, Origin, Role, RollOverProposal, SettlementKind,
+    UpdateCfdProposal, UpdateCfdProposals,
 };
-use crate::model::{BitMexPriceEventId, Price, Timestamp, Usd};
+use crate::model::{BitMexPriceEventId, Identity, Position, Price, Timestamp, Usd};
 use crate::monitor::{self, MonitorParams};
 use crate::projection::{
     try_into_update_rollover_proposal, UpdateRollOverProposal, UpdateSettlementProposal,
 };
-use crate::setup_contract::RolloverParams;
+use crate::setup_contract::RolloverError;
 use crate::tokio_ext::FutureExt;
 use crate::wire::RollOverMsg;
 use crate::{
-    collab_settlement_taker, connection, log_error, oracle, projection, setup_contract,
+    cfd_actors, collab_settlement_taker, connection, log_error, oracle, projection, setup_contract,
     setup_taker, wallet, wire, Tasks,
 };
 use anyhow::{bail, Context as _, Result};
@@ -48,7 +47,7 @@ pub struct Commit {
 
 pub struct CfdRollOverCompleted {
     pub order_id: OrderId,
-    pub dlc: Result<Dlc>,
+    pub dlc: Result<Dlc, RolloverError>,
 }
 
 enum RollOverState {
@@ -72,6 +71,8 @@ pub struct Actor<O, M, W> {
     oracle_actor: Address<O>,
     current_pending_proposals: UpdateCfdProposals,
     n_payouts: usize,
+    current_maker_order: Option<Order>,
+    maker_identity: Identity,
     tasks: Tasks,
 }
 
@@ -91,6 +92,7 @@ where
         monitor_actor: Address<M>,
         oracle_actor: Address<O>,
         n_payouts: usize,
+        maker_identity: Identity,
     ) -> Self {
         Self {
             db,
@@ -105,6 +107,8 @@ where
             n_payouts,
             setup_actors: AddressMap::default(),
             collab_settlement_actors: AddressMap::default(),
+            current_maker_order: None,
+            maker_identity,
             tasks: Tasks::default(),
         }
     }
@@ -204,7 +208,7 @@ where
             .with_context(|| format!("Settlement for order {} is already in progress", order_id))?;
 
         let mut conn = self.db.acquire().await?;
-        let cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
+        let cfd = load_cfd(order_id, &mut conn).await?;
 
         let this = ctx
             .address()
@@ -243,21 +247,23 @@ where
                 return Ok(());
             }
         };
-        let settlement_txid = settlement.tx.txid();
+        let _settlement_txid = settlement.tx.txid();
 
         let mut conn = self.db.acquire().await?;
-        let mut cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
-        let dlc = cfd.dlc().context("No DLC in CFD")?;
+        let cfd = load_cfd(order_id, &mut conn).await?;
 
-        cfd.handle_proposal_signed(settlement)?;
-        append_cfd_state(&cfd, &mut conn, &self.projection_actor).await?;
+        let event = cfd.settle_collaboratively_taker(settlement);
+        append_events(event, &mut conn).await?;
 
-        self.monitor_actor
-            .send(monitor::CollaborativeSettlement {
-                order_id,
-                tx: (settlement_txid, dlc.script_pubkey_for(Role::Taker)),
-            })
-            .await?;
+        // TODO: We used to update the UI here.
+        // TODO: CollaborativeSettlement needs to include payout address for monitoring.
+
+        // self.monitor_actor
+        //     .send(monitor::CollaborativeSettlement {
+        //         order_id,
+        //         tx: (settlement_txid, dlc.script_pubkey_for(Role::Taker)),
+        //     })
+        //     .await?;
 
         Ok(())
     }
@@ -298,18 +304,17 @@ impl<O, M, W> Actor<O, M, W> {
         tracing::trace!("new order {:?}", order);
         match order {
             Some(mut order) => {
-                order.origin = Origin::Theirs;
+                order.origin = Origin::Theirs; // TODO: We should no longer need this, only the maker can send orders.
 
-                let mut conn = self.db.acquire().await?;
+                // let mut conn = self.db.acquire().await?;
 
-                if load_cfd_by_order_id(order.id, &mut conn).await.is_ok() {
-                    bail!("Received order {} from maker, but already have a cfd in the database for that order. The maker did not properly remove the order.", order.id)
-                }
+                // TODO
+                // if load_cfd_by_order_id(order.id, &mut conn).await.is_ok() {
+                //     bail!("Received order {} from maker, but already have a cfd in the database
+                // for that order. The maker did not properly remove the order.", order.id)
+                // }
 
-                if load_order_by_id(order.id, &mut conn).await.is_err() {
-                    // only insert the order if we don't know it yet
-                    insert_order(&order, &mut conn).await?;
-                }
+                self.current_maker_order = Some(order.clone());
 
                 self.projection_actor
                     .send(projection::Update(Some(order)))
@@ -322,39 +327,12 @@ impl<O, M, W> Actor<O, M, W> {
         Ok(())
     }
 
-    async fn append_cfd_state_rejected(&mut self, order_id: OrderId) -> Result<()> {
-        tracing::debug!(%order_id, "Order rejected");
-
-        let mut conn = self.db.acquire().await?;
-        let mut cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
-        cfd.state = CfdState::rejected();
-        append_cfd_state(&cfd, &mut conn, &self.projection_actor).await?;
-
-        Ok(())
-    }
-
-    async fn append_cfd_state_setup_failed(
-        &mut self,
-        order_id: OrderId,
-        error: anyhow::Error,
-    ) -> Result<()> {
-        tracing::error!(%order_id, "Contract setup failed: {:#?}", error);
-
-        let mut conn = self.db.acquire().await?;
-        let mut cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
-        cfd.state = CfdState::setup_failed(error.to_string());
-        append_cfd_state(&cfd, &mut conn, &self.projection_actor).await?;
-
-        Ok(())
-    }
-
     /// Set the state of the CFD in the database to `ContractSetup`
     /// and update the corresponding projection.
-    async fn handle_setup_started(&mut self, order_id: OrderId) -> Result<()> {
-        let mut conn = self.db.acquire().await?;
-        let mut cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
-        cfd.state = CfdState::contract_setup();
-        append_cfd_state(&cfd, &mut conn, &self.projection_actor).await?;
+    async fn handle_setup_started(&mut self, _order_id: OrderId) -> Result<()> {
+        // let mut conn = self.db.acquire().await?;
+
+        // TODO: We used to update the UI here.
 
         Ok(())
     }
@@ -386,9 +364,11 @@ where
 
 impl<O, M, W> Actor<O, M, W>
 where
-    Self: xtra::Handler<Completed>,
     O: xtra::Handler<oracle::GetAnnouncement> + xtra::Handler<oracle::MonitorAttestation>,
-    W: xtra::Handler<wallet::BuildPartyParams> + xtra::Handler<wallet::Sign>,
+    W: xtra::Handler<wallet::BuildPartyParams>
+        + xtra::Handler<wallet::Sign>
+        + xtra::Handler<wallet::TryBroadcastTransaction>,
+    M: xtra::Handler<monitor::StartMonitoring>,
 {
     async fn handle_take_offer(
         &mut self,
@@ -406,19 +386,29 @@ where
                 )
             })?;
 
-        let mut conn = self.db.acquire().await?;
+        let current_order = self
+            .current_maker_order
+            .as_ref()
+            .context("No order present that can be taken")?
+            .clone();
 
-        let current_order = load_order_by_id(order_id, &mut conn).await?;
+        // We create the cfd here without any events yet, only static data
+        // Once the contract setup completes (rejected / accepted / failed) the first event will be
+        // recorded
+        let cfd = CfdAggregate::new(
+            current_order.id,
+            Position::Long,
+            current_order.price,
+            current_order.leverage,
+            current_order.settlement_interval,
+            quantity,
+            self.maker_identity,
+            Role::Taker,
+        );
+        let mut conn = self.db.acquire().await?;
+        insert_cfd(&cfd, &mut conn).await?;
 
         tracing::info!("Taking current order: {:?}", &current_order);
-
-        let cfd = Cfd::new(
-            current_order.clone(),
-            quantity,
-            CfdState::outgoing_order_request(),
-        );
-
-        insert_cfd_and_send_to_feed(&cfd, &mut conn, &self.projection_actor).await?;
 
         // Cleanup own order feed, after inserting the cfd.
         // Due to the 1:1 relationship between order and cfd we can never create another cfd for the
@@ -427,15 +417,15 @@ where
 
         let announcement = self
             .oracle_actor
-            .send(oracle::GetAnnouncement(cfd.order.oracle_event_id))
+            .send(oracle::GetAnnouncement(current_order.oracle_event_id))
             .await?
-            .with_context(|| format!("Announcement {} not found", cfd.order.oracle_event_id))?;
+            .with_context(|| format!("Announcement {} not found", current_order.oracle_event_id))?;
 
         let this = ctx
             .address()
             .expect("actor to be able to give address to itself");
         let (addr, fut) = setup_taker::Actor::new(
-            (current_order, quantity, self.n_payouts),
+            (cfd, quantity, self.n_payouts),
             (self.oracle_pk, announcement),
             &self.wallet,
             &self.wallet,
@@ -460,31 +450,26 @@ where
     M: xtra::Handler<monitor::StartMonitoring>,
     W: xtra::Handler<wallet::TryBroadcastTransaction>,
 {
-    async fn handle_setup_completed(&mut self, msg: Completed) -> Result<()> {
-        let (order_id, dlc) = match msg {
-            Completed::NewContract { order_id, dlc } => (order_id, dlc),
-            Completed::Rejected { order_id } => {
-                self.append_cfd_state_rejected(order_id).await?;
-                return Ok(());
-            }
-            Completed::Failed { order_id, error } => {
-                self.append_cfd_state_setup_failed(order_id, error).await?;
-                return Ok(());
-            }
-        };
-
+    async fn handle_setup_completed(&mut self, msg: setup_taker::Completed) -> Result<()> {
         let mut conn = self.db.acquire().await?;
-        let mut cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
+        let order_id = msg.order_id();
+
+        let cfd = load_cfd(order_id, &mut conn).await?;
+
+        let event = cfd.setup_contract(msg)?;
+        append_events(vec![event.clone()], &mut conn).await?;
 
         tracing::info!("Setup complete, publishing on chain now");
 
-        cfd.state = CfdState::PendingOpen {
-            common: CfdStateCommon::default(),
-            dlc: dlc.clone(),
-            attestation: None,
-        };
+        // TODO: We used to update the UI here
 
-        append_cfd_state(&cfd, &mut conn, &self.projection_actor).await?;
+        let dlc = match event.event {
+            CfdEvent::ContractSetupCompleted { dlc } => dlc,
+            CfdEvent::ContractSetupFailed { .. } => {
+                unimplemented!("We don't deal with contract setup failed scenarios yet")
+            }
+            _ => bail!("Unexpected event {:?}", event.event),
+        };
 
         let txid = self
             .wallet
@@ -498,7 +483,7 @@ where
         self.monitor_actor
             .send(monitor::StartMonitoring {
                 id: order_id,
-                params: MonitorParams::new(dlc.clone(), cfd.refund_timelock_in_blocks()),
+                params: MonitorParams::new(dlc.clone()),
             })
             .await?;
 
@@ -536,8 +521,8 @@ where
 
         let mut conn = self.db.acquire().await?;
 
-        let cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
-        let dlc = cfd.open_dlc().context("CFD was in wrong state")?;
+        let cfd = load_cfd(order_id, &mut conn).await?;
+        let (rollover_params, dlc, _) = cfd.start_rollover()?;
 
         let announcement = self
             .oracle_actor
@@ -550,12 +535,7 @@ where
                 .with(|msg| future::ok(wire::TakerToMaker::RollOverProtocol(msg))),
             receiver,
             (self.oracle_pk, announcement),
-            RolloverParams::new(
-                cfd.order.price,
-                cfd.quantity_usd,
-                cfd.order.leverage,
-                cfd.refund_timelock_in_blocks(),
-            ),
+            rollover_params,
             Role::Taker,
             dlc,
             self.n_payouts,
@@ -594,26 +574,30 @@ where
     async fn handle_roll_over_completed(
         &mut self,
         order_id: OrderId,
-        dlc: Result<Dlc>,
+        dlc: Result<Dlc, RolloverError>,
     ) -> Result<()> {
-        let dlc = dlc.context("Failed to roll over contract with maker")?;
         self.roll_over_state = RollOverState::None;
 
         let mut conn = self.db.acquire().await?;
-        let mut cfd = load_cfd_by_order_id(order_id, &mut conn).await?;
-        cfd.state = CfdState::Open {
-            common: CfdStateCommon::default(),
-            dlc: dlc.clone(),
-            attestation: None,
-            collaborative_close: None,
+        let cfd = load_cfd(order_id, &mut conn).await?;
+
+        let event = cfd.roll_over(dlc)?;
+        append_events(vec![event.clone()], &mut conn).await?;
+
+        let dlc = match event.event {
+            CfdEvent::RolloverCompleted { dlc } => dlc,
+            CfdEvent::RolloverFailed { .. } => {
+                unimplemented!("We are not dealing with failed rollover atm")
+            }
+            _ => bail!("Unexpected event {:?}", event.event),
         };
 
-        append_cfd_state(&cfd, &mut conn, &self.projection_actor).await?;
+        // TODO: We used to update the UI here
 
         self.monitor_actor
             .send(monitor::StartMonitoring {
                 id: order_id,
-                params: MonitorParams::new(dlc.clone(), cfd.refund_timelock_in_blocks()),
+                params: MonitorParams::new(dlc.clone()),
             })
             .await?;
 
@@ -630,9 +614,11 @@ where
 #[async_trait]
 impl<O: 'static, M: 'static, W: 'static> Handler<TakeOffer> for Actor<O, M, W>
 where
-    Self: xtra::Handler<Completed>,
     O: xtra::Handler<oracle::GetAnnouncement> + xtra::Handler<oracle::MonitorAttestation>,
-    W: xtra::Handler<wallet::BuildPartyParams> + xtra::Handler<wallet::Sign>,
+    W: xtra::Handler<wallet::BuildPartyParams>
+        + xtra::Handler<wallet::Sign>
+        + xtra::Handler<wallet::TryBroadcastTransaction>,
+    M: xtra::Handler<monitor::StartMonitoring>,
 {
     async fn handle(&mut self, msg: TakeOffer, ctx: &mut Context<Self>) -> Result<()> {
         self.handle_take_offer(msg.order_id, msg.quantity, ctx)
@@ -683,13 +669,13 @@ where
 }
 
 #[async_trait]
-impl<O: 'static, M: 'static, W: 'static> Handler<Completed> for Actor<O, M, W>
+impl<O: 'static, M: 'static, W: 'static> Handler<setup_taker::Completed> for Actor<O, M, W>
 where
     O: xtra::Handler<oracle::MonitorAttestation>,
     M: xtra::Handler<monitor::StartMonitoring>,
     W: xtra::Handler<wallet::TryBroadcastTransaction>,
 {
-    async fn handle(&mut self, msg: Completed, _ctx: &mut Context<Self>) {
+    async fn handle(&mut self, msg: setup_taker::Completed, _ctx: &mut Context<Self>) {
         log_error!(self.handle_setup_completed(msg))
     }
 }

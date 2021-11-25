@@ -5,8 +5,8 @@ use crate::harness::{
     dummy_new_order, init_tracing, start_both, Maker, MakerConfig, Taker, TakerConfig,
 };
 use daemon::connection::ConnectionStatus;
-use daemon::model::Usd;
-use daemon::projection::{CfdState, Identity};
+use daemon::model::cfd::CfdState;
+use daemon::model::{Identity, Usd};
 use maia::secp256k1_zkp::schnorrsig;
 use rust_decimal_macros::dec;
 use tokio::time::sleep;

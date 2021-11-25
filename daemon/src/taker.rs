@@ -4,9 +4,7 @@ use bdk::bitcoin::{Address, Amount};
 use bdk::{bitcoin, FeeRate};
 use clap::{Parser, Subcommand};
 use daemon::connection::connect;
-use daemon::db::load_all_cfds;
-use daemon::model::cfd::Role;
-use daemon::model::WalletInfo;
+use daemon::model::{Identity, WalletInfo};
 use daemon::seed::Seed;
 use daemon::tokio_ext::FutureExt;
 use daemon::{
@@ -226,6 +224,8 @@ async fn main() -> Result<()> {
 
     let (projection_actor, projection_context) = xtra::Context::new(None);
 
+    let maker_pubkey = opts.maker_id;
+
     let TakerActorSystem {
         cfd_actor_addr,
         connection_actor_addr,
@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
         HEARTBEAT_INTERVAL * 2,
         Duration::from_secs(10),
         projection_actor.clone(),
+        Identity::new(maker_pubkey),
     )
     .await?;
 
@@ -260,9 +261,9 @@ async fn main() -> Result<()> {
         .await??;
 
     let cfds = {
-        let mut conn = db.acquire().await?;
+        let _conn = db.acquire().await?;
 
-        load_all_cfds(&mut conn).await?
+        vec![]
     };
 
     let (proj_actor, projection_feeds) =
@@ -274,7 +275,7 @@ async fn main() -> Result<()> {
     tasks.add(connect(
         maker_online_status_feed_receiver.clone(),
         connection_actor_addr,
-        opts.maker_id,
+        maker_pubkey,
         possible_addresses,
     ));
 

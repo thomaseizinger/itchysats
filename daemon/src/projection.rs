@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::model::cfd::{
     Cfd as ModelCfd, OrderId, Role, RollOverProposal, SettlementKind, SettlementProposal,
     UpdateCfdProposal,
@@ -11,6 +9,7 @@ use bdk::bitcoin::{Amount, Network, SignedAmount};
 use itertools::Itertools;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use xtra_productivity::xtra_productivity;
@@ -41,6 +40,7 @@ pub struct Feeds {
     pub order: watch::Receiver<Option<CfdOrder>>,
     pub connected_takers: watch::Receiver<Vec<Identity>>,
     pub cfds: watch::Receiver<Vec<Cfd>>,
+    pub settlements: watch::Receiver<UpdateCfdProposals>,
 }
 
 impl Actor {
@@ -78,6 +78,7 @@ impl Actor {
                 order: rx_order,
                 quote: rx_quote,
                 connected_takers: rx_connected_takers,
+                settlements: todo!(),
             },
         )
     }

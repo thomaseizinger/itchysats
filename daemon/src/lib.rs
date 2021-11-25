@@ -1,8 +1,8 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 #![warn(clippy::disallowed_method)]
-use crate::db::load_all_cfds;
 use crate::maker_cfd::{FromTaker, TakerConnected};
 use crate::model::cfd::{Cfd, Order, UpdateCfdProposals};
+use crate::model::Identity;
 use crate::oracle::Attestation;
 use crate::tokio_ext::FutureExt;
 use anyhow::Result;
@@ -137,9 +137,9 @@ where
     where
         F: Future<Output = Result<M>>,
     {
-        let mut conn = db.acquire().await?;
+        // let mut conn = db.acquire().await?;
 
-        let cfds = load_all_cfds(&mut conn).await?;
+        let cfds: Vec<Cfd> = vec![]; // TODO: Load all cfd-aggregates (to be passed to monitor/oracle
 
         let (monitor_addr, mut monitor_ctx) = xtra::Context::new(None);
         let (oracle_addr, mut oracle_ctx) = xtra::Context::new(None);
@@ -237,13 +237,14 @@ where
         maker_heartbeat_interval: Duration,
         connect_timeout: Duration,
         projection_actor: Address<projection::Actor>,
+        maker_identity: Identity,
     ) -> Result<Self>
     where
         F: Future<Output = Result<M>>,
     {
-        let mut conn = db.acquire().await?;
+        // let mut conn = db.acquire().await?;
 
-        let cfds = load_all_cfds(&mut conn).await?;
+        let cfds: Vec<Cfd> = vec![]; // TODO: Load all cfd-aggregates (to be passed to monitor/oracle
 
         let (maker_online_status_feed_sender, maker_online_status_feed_receiver) =
             watch::channel(ConnectionStatus::Offline);
@@ -263,6 +264,7 @@ where
             monitor_addr.clone(),
             oracle_addr,
             n_payouts,
+            maker_identity,
         )
         .create(None)
         .run();

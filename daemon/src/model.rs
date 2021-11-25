@@ -388,12 +388,29 @@ pub enum Position {
     Short,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Identity(x25519_dalek::PublicKey);
 
 impl Identity {
     pub fn new(key: x25519_dalek::PublicKey) -> Self {
         Self(key)
+    }
+}
+impl fmt::Display for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.0.as_bytes()))
+    }
+}
+
+impl str::FromStr for Identity {
+    type Err = hex::FromHexError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut key = [0u8; 32];
+
+        hex::decode_to_slice(s, &mut key)?;
+
+        Ok(Self(key.into()))
     }
 }
 
@@ -417,24 +434,6 @@ impl<'de> Deserialize<'de> for Identity {
         hex::decode_to_slice(&hex, &mut bytes).map_err(D::Error::custom)?;
 
         Ok(Self(x25519_dalek::PublicKey::from(bytes)))
-    }
-}
-
-impl fmt::Display for Identity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.0.as_bytes()))
-    }
-}
-
-impl str::FromStr for Identity {
-    type Err = hex::FromHexError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = [0u8; 32];
-
-        hex::decode_to_slice(s, &mut key)?;
-
-        Ok(Self(key.into()))
     }
 }
 
@@ -529,6 +528,7 @@ impl str::FromStr for BitMexPriceEventId {
 impl_sqlx_type_display_from_str!(BitMexPriceEventId);
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct Timestamp(i64);
 
 impl Timestamp {
@@ -678,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_taker_id_serde() {
+    fn roundtrip_identity_serde() {
         let id = Identity::new(x25519_dalek::PublicKey::from([42u8; 32]));
 
         serde_test::assert_tokens(

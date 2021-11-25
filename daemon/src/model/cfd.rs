@@ -2,7 +2,8 @@ use crate::model::{
     BitMexPriceEventId, Identity, InversePrice, Leverage, Percent, Position, Price, Timestamp,
     TradingPair, Usd,
 };
-use crate::{monitor, oracle, payout_curve};
+use crate::setup_contract::{ContractSetupError, RolloverError, RolloverParams, SetupParams};
+use crate::{monitor, oracle, payout_curve, setup_taker};
 use anyhow::{bail, Context, Result};
 use bdk::bitcoin::secp256k1::{SecretKey, Signature};
 use bdk::bitcoin::{Address, Amount, PublicKey, Script, SignedAmount, Transaction, Txid};
@@ -16,8 +17,8 @@ use rust_decimal::Decimal;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt;
 use std::ops::RangeInclusive;
+use std::{fmt, str};
 use time::{Duration, OffsetDateTime};
 use uuid::adapter::Hyphenated;
 use uuid::Uuid;
@@ -77,7 +78,7 @@ pub enum Origin {
 }
 
 /// Role in the Cfd
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, sqlx::Type)]
 pub enum Role {
     Maker,
     Taker,
@@ -110,6 +111,8 @@ pub struct Order {
     // TODO: [post-MVP] - Once we have multiple leverage we will have to move leverage and
     //  liquidation_price into the CFD and add a calculation endpoint for the taker buy screen
     pub leverage: Leverage,
+
+    // TODO: Remove from order, can be calculated
     pub liquidation_price: Price,
 
     pub creation_timestamp: Timestamp,
@@ -122,6 +125,7 @@ pub struct Order {
     /// The id of the event to be used for price attestation
     ///
     /// The maker includes this into the Order based on the Oracle announcement to be used.
+    // TODO: Should be persisted with contract setup completion
     pub oracle_event_id: BitMexPriceEventId,
 }
 
@@ -1076,32 +1080,6 @@ impl Cfd {
         dlc.signed_commit_tx()
     }
 
-    pub fn cet(&self) -> Result<Result<Transaction, NotReadyYet>> {
-        let (dlc, attestation) = match self.state.clone() {
-            CfdState::OpenCommitted {
-                dlc,
-                cet_status: CetStatus::Ready(attestation),
-                ..
-            }
-            | CfdState::PendingCet {
-                dlc, attestation, ..
-            } => (dlc, attestation),
-            CfdState::OpenCommitted { cet_status, .. } => {
-                return Ok(Err(NotReadyYet { cet_status }));
-            }
-            CfdState::Open { .. } | CfdState::PendingCommit { .. } => {
-                return Ok(Err(NotReadyYet {
-                    cet_status: CetStatus::Unprepared,
-                }));
-            }
-            _ => bail!("Cannot publish CET in state {}", self.state.clone()),
-        };
-
-        let signed_cet = dlc.signed_cet(&attestation)?;
-
-        Ok(Ok(signed_cet))
-    }
-
     pub fn pending_open_dlc(&self) -> Option<Dlc> {
         if let CfdState::PendingOpen { dlc, .. } = self.state.clone() {
             Some(dlc)
@@ -1256,6 +1234,616 @@ impl Cfd {
             (Some(attestation), None) => Some(attestation.payout()),
             (None, None) => None,
         }
+    }
+}
+
+// purpose to aligne the api on both maker and taker not necessarily to abstract over them (yet)
+pub trait Aggregate {
+    type Item;
+
+    fn version(&self) -> u64;
+    fn apply(self, evt: &Self::Item) -> Self
+    where
+        Self: Sized;
+}
+
+#[derive(Clone)]
+pub struct Event {
+    pub timestamp: Timestamp,
+    pub id: OrderId,
+    pub event: CfdEvent,
+}
+
+impl Event {
+    pub fn new(id: OrderId, event: CfdEvent) -> Self {
+        Event {
+            timestamp: Timestamp::now(),
+            id,
+            event,
+        }
+    }
+}
+
+/// CfdEvents used by the maker and taker, some events are only for one role
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+#[serde(tag = "name", content = "data")]
+pub enum CfdEvent {
+    ContractSetupCompleted {
+        dlc: Dlc,
+    },
+
+    /// If we fail to complete the contract setup we might still return a Dlc that can be used
+    /// for monitoring but not for lock transaction publication.
+    ContractSetupFailed {
+        maybe_incomplete_dlc: Option<Dlc>,
+    },
+
+    OfferRejected,
+
+    RolloverCompleted {
+        dlc: Dlc,
+    },
+    RolloverRejected,
+    RolloverFailed {
+        maybe_incomplete_dlc: Option<Dlc>,
+    },
+
+    CollaborativeSettlementCompleted {
+        spend_tx: Transaction,
+        script: Script,
+    },
+    CollaborativeSettlementRejected {
+        commit_tx: Transaction, // TODO: Save transaction as hex
+    },
+    // TODO: What does "failed" mean here? Do we have to record this as event? what would it mean?
+    CollaborativeSettlementFailed {
+        commit_tx: Transaction, // TODO: Save transaction as hex
+    },
+
+    // TODO: The monitoring events should move into the monitor once we use multiple
+    // aggregates in different actors
+    LockConfirmed,
+    CommitConfirmed,
+    CetConfirmed,
+    RefundConfirmed,
+    CollaborativeSettlementConfirmed,
+
+    CetTimelockConfirmedPriorOracleAttestation,
+    CetTimelockConfirmedPostOracleAttestation {
+        cet: Transaction, // TODO: Save transaction as hex
+    },
+
+    RefundTimelockConfirmed {
+        refund_tx: Transaction, // TODO: Save transaction as hex
+    },
+
+    // TODO: Once we use multiple aggregates in different actors we could change this to something
+    // like CetReadyForPublication that is emitted by the CfdActor. The Oracle actor would
+    // take care of saving and broadcasting an attestation event that can be picked up by the
+    // wallet actor which can then decide to publish the CetReadyForPublication event.
+    OracleAttestedPriorCetTimelock {
+        timelocked_cet: Transaction, // TODO: Save transaction as hex
+        commit_tx: Transaction,      // TODO: Save transaction as hex
+    },
+    OracleAttestedPostCetTimelock {
+        cet: Transaction, // TODO: Save transaction as hex
+    },
+    Committed {
+        tx: Transaction, // TODO: Save transaction as hex
+    },
+}
+
+impl CfdEvent {
+    pub fn to_json(&self) -> (String, String) {
+        let value = serde_json::to_value(self).expect("serialization to always work");
+        let object = value.as_object().expect("always an object");
+
+        let name = object
+            .get("name")
+            .expect("to have property `name`")
+            .as_str()
+            .expect("name to be `string`")
+            .to_owned();
+        let data = object.get("data").cloned().unwrap_or_default().to_string();
+
+        (name, data)
+    }
+
+    pub fn from_json(name: String, data: String) -> Result<Self> {
+        use serde_json::json;
+
+        let data = serde_json::from_str::<serde_json::Value>(&data)?;
+
+        let event = serde_json::from_value::<Self>(json!({
+            "name": name,
+            "data": data
+        }))?;
+
+        Ok(event)
+    }
+}
+
+/// Models the cfd state of the taker
+///
+/// Upon `Command`s, that are reaction to something happening in the system, we decide to
+/// produce `Event`s that are saved in the database. After saving an `Event` in the database
+/// we apply the event to the aggregate producing a new aggregate (representing the latest state
+/// `version`). To bring a cfd into a certain state version we load all events from the
+/// database and apply them in order (order by version).
+#[derive(Debug, PartialEq)]
+pub struct CfdAggregate {
+    version: u64,
+
+    // static
+    id: OrderId,
+    position: Position,
+    initial_price: Price,
+    leverage: Leverage,
+    settlement_interval: Duration,
+    quantity: Usd,
+    counterparty_network_identity: Identity,
+    role: Role,
+
+    // dynamic (based on events)
+    dlc: Option<Dlc>,
+
+    /// Holds the decrypted CET.
+    ///
+    /// Only `Some` in case we receive the attestation prior to the CET timelock expiring.
+    cet: Option<Transaction>,
+
+    /// Holds the commit transaction, in case we've previously broadcasted it.
+    ///
+    /// This does _not_ imply that the transaction is actually confirmed.
+    /// TODO: Create an enum here that has variants None, Broadcasted, Final and get rid of boolean
+    /// value?
+    commit_tx: Option<Transaction>,
+
+    collaborative_settlement_spend_tx: Option<Transaction>,
+
+    lock_finality: bool,
+    commit_finality: bool,
+    refund_finality: bool,
+    cet_finality: bool,
+    collaborative_settlement_finality: bool,
+
+    cet_timelock_expired: bool,
+    refund_timelock_expired: bool,
+}
+
+impl CfdAggregate {
+    pub fn new(
+        id: OrderId,
+        position: Position,
+        initial_price: Price,
+        leverage: Leverage,
+        settlement_interval: Duration, /* TODO: Make a newtype that enforces hours only so
+                                        * we don't have to deal with precisions in the
+                                        * database. */
+        quantity: Usd,
+        counterparty_network_identity: Identity,
+        role: Role,
+    ) -> Self {
+        CfdAggregate {
+            version: 0,
+            id,
+            position,
+            initial_price,
+            leverage,
+            settlement_interval,
+            quantity,
+            counterparty_network_identity,
+            role,
+
+            dlc: None,
+            cet: None,
+            commit_tx: None,
+            collaborative_settlement_spend_tx: None,
+            lock_finality: false,
+            commit_finality: false,
+            refund_finality: false,
+            cet_finality: false,
+            collaborative_settlement_finality: false,
+            cet_timelock_expired: false,
+            refund_timelock_expired: false,
+        }
+    }
+
+    fn can_roll_over(&self) -> bool {
+        self.lock_finality && !self.commit_finality && !self.is_final() && !self.is_attested()
+    }
+
+    fn can_settle_collaboratively(&self) -> bool {
+        self.lock_finality && !self.commit_finality && !self.is_final() && !self.is_attested()
+    }
+
+    fn is_attested(&self) -> bool {
+        self.cet.is_some()
+    }
+
+    fn is_final(&self) -> bool {
+        self.collaborative_settlement_finality || self.cet_finality || self.refund_finality
+    }
+
+    pub fn start_contract_setup(&self) -> Result<(SetupParams, Identity)> {
+        if self.version > 0 {
+            bail!("Start contract not allowed in version {}", self.version)
+        }
+
+        let margin = match self.position {
+            Position::Long => {
+                calculate_long_margin(self.initial_price, self.quantity, self.leverage)
+            }
+            Position::Short => calculate_short_margin(self.initial_price, self.quantity),
+        };
+
+        let counterparty_margin = match self.position {
+            Position::Long => calculate_short_margin(self.initial_price, self.quantity),
+            Position::Short => {
+                calculate_long_margin(self.initial_price, self.quantity, self.leverage)
+            }
+        };
+
+        Ok((
+            SetupParams::new(
+                margin,
+                counterparty_margin,
+                self.initial_price,
+                self.quantity,
+                self.leverage,
+                self.refund_timelock_in_blocks(),
+            ),
+            self.counterparty_network_identity,
+        ))
+    }
+
+    pub fn start_rollover(&self) -> Result<(RolloverParams, Dlc, Duration)> {
+        if !self.can_roll_over() {
+            bail!("Start rollover only allowed when open")
+        }
+
+        Ok((
+            RolloverParams::new(
+                self.initial_price,
+                self.quantity,
+                self.leverage,
+                self.refund_timelock_in_blocks(),
+            ),
+            self.dlc
+                .as_ref()
+                .context("dlc has to be available for rollover")?
+                .clone(),
+            self.settlement_interval,
+        ))
+    }
+
+    pub fn start_collaborative_settlement(
+        &self,
+        current_price: Price,
+        n_payouts: usize,
+    ) -> Result<SettlementProposal> {
+        if !self.can_settle_collaboratively() {
+            bail!("Start collaborative settlement only allowed when open")
+        }
+
+        let payout_curve = payout_curve::calculate(
+            // TODO: Is this correct? Does rollover change the price? (I think currently not)
+            self.initial_price,
+            self.quantity,
+            self.leverage,
+            n_payouts,
+        )?;
+
+        let payout = {
+            let current_price = current_price.try_into_u64()?;
+            payout_curve
+                .iter()
+                .find(|&x| x.digits().range().contains(&current_price))
+                .context("find current price on the payout curve")?
+        };
+
+        let settlement_proposal = SettlementProposal {
+            order_id: self.id,
+            timestamp: Timestamp::now(),
+            taker: *payout.taker_amount(),
+            maker: *payout.maker_amount(),
+            price: current_price,
+        };
+
+        Ok(settlement_proposal)
+    }
+
+    pub fn setup_contract(self, completed: setup_taker::Completed) -> Result<Event> {
+        if self.version > 0 {
+            bail!(
+                "Complete contract setup not allowed because cfd already in version {}",
+                self.version
+            )
+        }
+
+        let event = match completed {
+            setup_taker::Completed::NewContract { order_id, dlc } => {
+                CfdEvent::ContractSetupCompleted { dlc }
+            }
+            setup_taker::Completed::Rejected { order_id } => CfdEvent::OfferRejected,
+            setup_taker::Completed::Failed {
+                order_id,
+                error: ContractSetupError::FailedBeforeLockSignature { source },
+            } => CfdEvent::ContractSetupFailed {
+                maybe_incomplete_dlc: None,
+            },
+            setup_taker::Completed::Failed {
+                order_id,
+                error:
+                    ContractSetupError::LockTransactionSignatureSentButNotReceived {
+                        incomplete_dlc,
+                        ..
+                    },
+            } => CfdEvent::ContractSetupFailed {
+                maybe_incomplete_dlc: Some(incomplete_dlc),
+            },
+        };
+
+        Ok(self.event(event))
+    }
+
+    pub fn roll_over(self, rollover_result: Result<Dlc, RolloverError>) -> Result<Event> {
+        // TODO: Compare that the version that we started the rollover with is the same as the
+        // version now. For that to work we should pass the version into the state machine
+        // that will handle rollover and the pass it back in here for comparison.
+        if !self.can_roll_over() {
+            bail!("Complete rollover only allowed when open")
+        }
+
+        let event = match rollover_result {
+            Ok(dlc) => CfdEvent::RolloverCompleted { dlc },
+            Err(err) => match err {
+                RolloverError::FailedBeforeRevocationSignatures { .. } => {
+                    CfdEvent::RolloverFailed {
+                        maybe_incomplete_dlc: None,
+                    }
+                }
+                RolloverError::RevocationSignaturesSentButNotReceived {
+                    incomplete_dlc, ..
+                } => CfdEvent::RolloverFailed {
+                    maybe_incomplete_dlc: Some(incomplete_dlc),
+                },
+            },
+        };
+
+        Ok(self.event(event))
+    }
+
+    pub fn settle_collaboratively_taker(self, settlement: CollaborativeSettlement) -> Event {
+        todo!("Du to the asymmetric nature of collaborative settlement we would need separate command processing for maker and taker at the moment.")
+
+        // Currently there is this flow:
+        // Taker -> Maker: propose settlement
+        // Maker -> Taker: accept settlement (or reject as part of this command)
+        // Taker -> Maker: handle accept (settle_collaboratively_taker)
+        // Maker -> Taker: initiate settlement (settle_collaboratively_maker)
+
+        // Instead we should:
+        // 1. Create a dedicated actor for collab settlement (that handles all three outcomes,
+        // completed, failed, rejected)
+        // 2. Make the protocol symmetric, see: https://github.com/itchysats/itchysats/issues/320
+        // 3. command handling should be similar to contract setup in our CfdAggregate then
+    }
+
+    pub fn settle_collaboratively_maker(
+        self,
+        settlement_proposal: SettlementProposal,
+        counterparty_signature: Signature,
+    ) -> Result<Event> {
+        if !self.can_settle_collaboratively() {
+            bail!("Cannot collaboratively settle anymore")
+        }
+
+        let dlc = self
+            .dlc
+            .clone()
+            .context("No Dlc present when collaboratively settling")?;
+
+        // TODO: Correct that these ? lead to CollaborativeSettlementFailed? - i.e. if we fail here
+        // we publish commit tx...
+        let event = match dlc.close_transaction(&settlement_proposal) {
+            Ok((tx, own_signature)) => {
+                match dlc.finalize_spend_transaction((tx, own_signature), counterparty_signature) {
+                    Ok(spend_tx) => {
+                        let own_script_pubkey = dlc.script_pubkey_for(self.role);
+
+                        CfdEvent::CollaborativeSettlementCompleted {
+                            spend_tx,
+                            script: own_script_pubkey,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(order_id=%self.id, "Unable to finalize collaborative settlement transaction: {:#}", e);
+                        CfdEvent::CollaborativeSettlementFailed {
+                            commit_tx: dlc.signed_commit_tx()?,
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(order_id=%self.id, "Unable to create collaborative settlement transaction: {:#}", e);
+                CfdEvent::CollaborativeSettlementFailed {
+                    commit_tx: dlc.signed_commit_tx()?,
+                }
+            }
+        };
+
+        Ok(self.event(event))
+    }
+
+    /// Given an attestation, find and decrypt the relevant CET.
+    pub fn decrypt_cet(self, attestation: &oracle::Attestation) -> Result<Option<Event>> {
+        let dlc = match self.dlc.as_ref() {
+            Some(dlc) => dlc,
+            None => {
+                tracing::warn!(order_id = %self.id(), "Handling attestation without a DLC is a no-op");
+                return Ok(None);
+            }
+        };
+
+        let cet = match dlc.signed_cet(attestation)? {
+            Ok(cet) => cet,
+            Err(e @ IrrelevantAttestation { .. }) => {
+                tracing::debug!("{}", e);
+                return Ok(None);
+            }
+        };
+
+        if self.cet_finality {
+            return Ok(Some(
+                self.event(CfdEvent::OracleAttestedPostCetTimelock { cet }),
+            ));
+        }
+
+        return Ok(Some(self.event(CfdEvent::OracleAttestedPriorCetTimelock {
+            timelocked_cet: cet,
+            commit_tx: dlc.signed_commit_tx()?,
+        })));
+    }
+
+    pub fn handle_cet_timelock_expired(mut self) -> Event {
+        let cfd_event = self
+            .cet
+            .take()
+            .map(|cet| CfdEvent::CetTimelockConfirmedPostOracleAttestation { cet })
+            .unwrap_or_else(|| CfdEvent::CetTimelockConfirmedPriorOracleAttestation);
+
+        self.event(cfd_event)
+    }
+
+    pub fn handle_refund_timelock_expired(self) -> Event {
+        todo!()
+    }
+
+    pub fn commit_to_blockchain(&self) -> Result<Event> {
+        // TODO: Check pre-conditions where commit is not allowed. Are there any?
+
+        let dlc = self.dlc.as_ref().context("Cannot commit without a DLC")?;
+
+        Ok(self.event(CfdEvent::Committed {
+            tx: dlc.signed_commit_tx()?,
+        }))
+    }
+
+    fn event(&self, event: CfdEvent) -> Event {
+        Event::new(self.id, event)
+    }
+
+    /// A factor to be added to the CFD order settlement_interval for calculating the
+    /// refund timelock.
+    ///
+    /// The refund timelock is important in case the oracle disappears or never publishes a
+    /// signature. Ideally, both users collaboratively settle in the refund scenario. This
+    /// factor is important if the users do not settle collaboratively.
+    /// `1.5` times the settlement_interval as defined in CFD order should be safe in the
+    /// extreme case where a user publishes the commit transaction right after the contract was
+    /// initialized. In this case, the oracle still has `1.0 *
+    /// cfdorder.settlement_interval` time to attest and no one can publish the refund
+    /// transaction.
+    /// The downside is that if the oracle disappears: the users would only notice at the end
+    /// of the cfd settlement_interval. In this case the users has to wait for another
+    /// `1.5` times of the settlement_interval to get his funds back.
+    const REFUND_THRESHOLD: f32 = 1.5;
+
+    fn refund_timelock_in_blocks(&self) -> u32 {
+        (self.settlement_interval * Self::REFUND_THRESHOLD)
+            .as_blocks()
+            .ceil() as u32
+    }
+
+    pub fn id(&self) -> OrderId {
+        self.id
+    }
+
+    pub fn position(&self) -> Position {
+        self.position
+    }
+
+    pub fn initial_price(&self) -> Price {
+        self.initial_price
+    }
+
+    pub fn leverage(&self) -> Leverage {
+        self.leverage
+    }
+
+    pub fn settlement_time_interval_hours(&self) -> Duration {
+        self.settlement_interval.clone()
+    }
+
+    pub fn quantity(&self) -> Usd {
+        self.quantity
+    }
+
+    pub fn counterparty_network_identity(&self) -> Identity {
+        self.counterparty_network_identity
+    }
+
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    pub fn sign_collaborative_close_transaction(
+        &self,
+        proposal: &SettlementProposal,
+    ) -> (Transaction, Signature, Script) {
+        todo!()
+    }
+}
+
+impl Aggregate for CfdAggregate {
+    type Item = Event;
+
+    fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn apply(mut self, evt: &Self::Item) -> CfdAggregate {
+        use CfdEvent::*;
+
+        self.version += 1;
+
+        match &evt.event {
+            ContractSetupCompleted { dlc } => self.dlc = Some(dlc.clone()),
+            OracleAttestedPostCetTimelock { cet } => self.cet = Some(cet.clone()),
+            OracleAttestedPriorCetTimelock { timelocked_cet, .. } => {
+                self.cet = Some(timelocked_cet.clone());
+            }
+            ContractSetupFailed { .. } => todo!(),
+            RolloverCompleted { dlc } => {
+                self.dlc = Some(dlc.clone());
+            }
+            RolloverFailed { .. } => todo!(),
+            RolloverRejected => todo!(),
+            CollaborativeSettlementCompleted { spend_tx, .. } => {
+                self.collaborative_settlement_spend_tx = Some(spend_tx.clone())
+            }
+            CollaborativeSettlementRejected { .. } => todo!(),
+            CollaborativeSettlementFailed { .. } => todo!(),
+
+            CetConfirmed => self.cet_finality = true,
+            RefundConfirmed => self.refund_finality = true,
+            CollaborativeSettlementConfirmed => self.collaborative_settlement_finality = true,
+            RefundTimelockConfirmed { .. } => self.refund_timelock_expired = true,
+            LockConfirmed => self.lock_finality = true,
+            CommitConfirmed => self.commit_finality = true,
+            CetTimelockConfirmedPriorOracleAttestation
+            | CetTimelockConfirmedPostOracleAttestation { .. } => {
+                self.cet_timelock_expired = true;
+            }
+            OfferRejected => {
+                // nothing to do here? A rejection means it should be impossible to issue any
+                // commands
+            }
+            Committed { tx } => todo!(),
+        }
+
+        self
     }
 }
 
@@ -1431,6 +2019,7 @@ pub struct Dlc {
     // (settlement and liquidation-point). We should NOT make these fields public on the Dlc
     // and create an internal structure that depicts this properly and avoids duplication.
     pub settlement_event_id: BitMexPriceEventId,
+    pub refund_timelock: u32,
 }
 
 impl Dlc {
@@ -1553,11 +2142,19 @@ impl Dlc {
         Ok(signed_commit_tx)
     }
 
-    pub fn signed_cet(&self, attestation: &Attestation) -> Result<Transaction> {
-        let cets = self
-            .cets
-            .get(&attestation.id)
-            .context("Unable to find oracle event id within the cets of the self")?;
+    pub fn signed_cet(
+        &self,
+        attestation: &oracle::Attestation,
+    ) -> Result<Result<Transaction, IrrelevantAttestation>> {
+        let cets = match self.cets.get(&attestation.id) {
+            Some(cets) => cets,
+            None => {
+                return Ok(Err(IrrelevantAttestation {
+                    id: attestation.id,
+                    tx_id: self.lock.0.txid(),
+                }))
+            }
+        };
 
         let Cet {
             tx: cet,
@@ -1595,8 +2192,15 @@ impl Dlc {
             (counterparty_pubkey, counterparty_sig),
         )?;
 
-        Ok(signed_cet)
+        Ok(Ok(signed_cet))
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Attestation {id} is irrelevant for DLC {tx_id}")]
+pub struct IrrelevantAttestation {
+    id: BitMexPriceEventId,
+    tx_id: Txid,
 }
 
 /// Information which we need to remember in order to construct a
@@ -1926,5 +2530,52 @@ mod tests {
         let deserialized = serde_json::from_str(&serde_json::to_string(&id).unwrap()).unwrap();
 
         assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn cfd_event_to_json() {
+        let event = CfdEvent::ContractSetupFailed {
+            maybe_incomplete_dlc: None,
+        };
+
+        let (name, data) = event.to_json();
+
+        assert_eq!(name, "ContractSetupFailed");
+        assert_eq!(data, r#"{"maybe_dlc":null}"#);
+    }
+
+    #[test]
+    fn cfd_event_from_json() {
+        let name = "ContractSetupFailed".to_owned();
+        let data = r#"{"maybe_dlc":null}"#.to_owned();
+
+        let event = CfdEvent::from_json(name, data).unwrap();
+
+        assert_eq!(
+            event,
+            CfdEvent::ContractSetupFailed {
+                maybe_incomplete_dlc: None
+            }
+        );
+    }
+
+    #[test]
+    fn cfd_event_no_data_to_json() {
+        let event = CfdEvent::OfferRejected;
+
+        let (name, data) = event.to_json();
+
+        assert_eq!(name, "OfferRejected");
+        assert_eq!(data, r#"null"#);
+    }
+
+    #[test]
+    fn cfd_event_no_data_from_json() {
+        let name = "OfferRejected".to_owned();
+        let data = r#"null"#.to_owned();
+
+        let event = CfdEvent::from_json(name, data).unwrap();
+
+        assert_eq!(event, CfdEvent::OfferRejected);
     }
 }

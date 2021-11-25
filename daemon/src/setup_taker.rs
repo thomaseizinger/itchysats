@@ -1,7 +1,7 @@
-use crate::model::cfd::{Cfd, CfdState, Completed, Dlc, Order, OrderId, Role};
+use crate::model::cfd::{CfdAggregate, Dlc, OrderId, Role};
 use crate::model::Usd;
 use crate::oracle::Announcement;
-use crate::setup_contract::{self, SetupParams};
+use crate::setup_contract::{self, ContractSetupError};
 use crate::tokio_ext::spawn_fallible;
 use crate::wire::{self, SetupMsg};
 use crate::{connection, wallet};
@@ -14,7 +14,7 @@ use xtra::prelude::*;
 use xtra_productivity::xtra_productivity;
 
 pub struct Actor {
-    order: Order,
+    cfd: CfdAggregate,
     quantity: Usd,
     n_payouts: usize,
     oracle_pk: schnorrsig::PublicKey,
@@ -30,7 +30,7 @@ pub struct Actor {
 impl Actor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        (order, quantity, n_payouts): (Order, Usd, usize),
+        (cfd, quantity, n_payouts): (CfdAggregate, Usd, usize),
         (oracle_pk, announcement): (schnorrsig::PublicKey, Announcement),
         build_party_params: &(impl MessageChannel<wallet::BuildPartyParams> + 'static),
         sign: &(impl MessageChannel<wallet::Sign> + 'static),
@@ -39,7 +39,7 @@ impl Actor {
         on_completed: &(impl MessageChannel<Completed> + 'static),
     ) -> Self {
         Self {
-            order,
+            cfd,
             quantity,
             n_payouts,
             oracle_pk,
@@ -57,18 +57,13 @@ impl Actor {
 #[xtra_productivity]
 impl Actor {
     fn handle(&mut self, _: Accepted, ctx: &mut xtra::Context<Self>) -> Result<()> {
-        let order_id = self.order.id;
+        let order_id = self.cfd.id();
         tracing::info!(%order_id, "Order got accepted");
 
         // inform the `taker_cfd::Actor` about the start of contract
         // setup, so that the db and UI can be updated accordingly
         self.on_accepted.send(Started(order_id)).await?;
-
-        let cfd = Cfd::new(
-            self.order.clone(),
-            self.quantity,
-            CfdState::contract_setup(),
-        );
+        let (setup_params, _) = self.cfd.start_contract_setup()?;
 
         let (sender, receiver) = mpsc::unbounded::<SetupMsg>();
         // store the writing end to forward messages from the taker to
@@ -80,14 +75,7 @@ impl Actor {
                 .with(move |msg| future::ok(wire::TakerToMaker::Protocol { order_id, msg })),
             receiver,
             (self.oracle_pk, self.announcement.clone()),
-            SetupParams::new(
-                cfd.margin()?,
-                cfd.counterparty_margin()?,
-                cfd.order.price,
-                cfd.quantity_usd,
-                cfd.order.leverage,
-                cfd.refund_timelock_in_blocks(),
-            ),
+            setup_params,
             self.build_party_params.clone_channel(),
             self.sign.clone_channel(),
             Role::Taker,
@@ -108,7 +96,7 @@ impl Actor {
     }
 
     fn handle(&mut self, msg: Rejected, ctx: &mut xtra::Context<Self>) -> Result<()> {
-        let order_id = self.order.id;
+        let order_id = self.cfd.id();
         tracing::info!(%order_id, "Order got rejected");
 
         if msg.is_invalid_order {
@@ -116,7 +104,9 @@ impl Actor {
         }
 
         self.on_completed
-            .send(Completed::Rejected { order_id })
+            .send(Completed::Rejected {
+                order_id: self.cfd.id(),
+            })
             .await?;
 
         ctx.stop();
@@ -170,14 +160,14 @@ impl xtra::Actor for Actor {
         let res = self
             .maker
             .send(connection::TakeOrder {
-                order_id: self.order.id,
+                order_id: self.cfd.id(),
                 quantity: self.quantity,
                 address,
             })
             .await;
 
         if let Err(e) = res {
-            tracing::error!(%self.order.id, "Stopping setup_taker actor: {}", e);
+            tracing::error!(order_id = %self.cfd.id(), "Stopping setup_taker actor: {}", e);
             ctx.stop()
         }
     }
@@ -212,7 +202,7 @@ pub struct SetupSucceeded {
 /// notify that the contract setup has failed.
 pub struct SetupFailed {
     order_id: OrderId,
-    error: anyhow::Error,
+    error: ContractSetupError,
 }
 
 impl Rejected {
@@ -228,6 +218,31 @@ impl Rejected {
     pub fn invalid_order_id() -> Self {
         Rejected {
             is_invalid_order: true,
+        }
+    }
+}
+/// Message sent from the `setup_taker::Actor` to the
+/// `taker_cfd::Actor` to notify that the contract setup has finished.
+pub enum Completed {
+    NewContract {
+        order_id: OrderId,
+        dlc: Dlc,
+    },
+    Rejected {
+        order_id: OrderId,
+    },
+    Failed {
+        order_id: OrderId,
+        error: ContractSetupError,
+    },
+}
+
+impl Completed {
+    pub fn order_id(&self) -> OrderId {
+        match &self {
+            Completed::NewContract { order_id, .. } => *order_id,
+            Completed::Rejected { order_id } => *order_id,
+            Completed::Failed { order_id, .. } => *order_id,
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::connection::ConnectionStatus;
 use crate::model;
-use crate::model::Timestamp;
-use crate::projection::{Cfd, CfdAction, CfdOrder, Identity, Quote};
+use crate::model::{Identity, Timestamp};
+use crate::projection::{Cfd, CfdAction, CfdOrder, Quote};
 use bdk::bitcoin::Amount;
 use rocket::request::FromParam;
 use rocket::response::stream::Event;
@@ -28,7 +28,8 @@ impl ToSseEvent for Vec<Cfd> {
 
 impl ToSseEvent for Vec<Identity> {
     fn to_sse_event(&self) -> Event {
-        Event::json(&self).event("takers")
+        let takers = self.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        Event::json(&takers).event("takers")
     }
 }
 
