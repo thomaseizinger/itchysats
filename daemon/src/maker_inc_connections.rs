@@ -5,7 +5,10 @@ use crate::model::Identity;
 use crate::noise::TransportStateExt;
 use crate::tokio_ext::FutureExt;
 use crate::wire::{taker_to_maker, EncryptedJsonCodec, MakerToTaker, TakerToMaker, Version};
-use crate::{collab_settlement_maker, maker_cfd, noise, send_to_socket, setup_maker, wire, Tasks};
+use crate::{
+    collab_settlement_maker, maker_cfd, noise, rollover_maker, send_to_socket, setup_maker, wire,
+    Tasks,
+};
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, TryStreamExt};
 use std::collections::HashMap;
@@ -86,6 +89,7 @@ pub struct Actor {
     heartbeat_interval: Duration,
     setup_actors: AddressMap<OrderId, setup_maker::Actor>,
     settlement_actors: AddressMap<OrderId, collab_settlement_maker::Actor>,
+    rollover_actors: AddressMap<OrderId, rollover_maker::Actor>,
     connection_tasks: HashMap<Identity, Tasks>,
 }
 
@@ -106,6 +110,7 @@ impl Actor {
             heartbeat_interval,
             setup_actors: AddressMap::default(),
             settlement_actors: AddressMap::default(),
+            rollover_actors: AddressMap::default(),
             connection_tasks: HashMap::new(),
         }
     }
@@ -326,6 +331,11 @@ impl Actor {
                     tracing::error!(%order_id, "No active contract setup");
                 }
             },
+            RollOverProtocol { order_id, msg } => {
+                if self.rollover_actors.send(&order_id, msg).await.is_err() {
+                    tracing::warn!(%order_id, "No active rollover actor")
+                }
+            }
             Settlement {
                 order_id,
                 msg: taker_to_maker::Settlement::Initiate { sig_taker },
@@ -347,6 +357,10 @@ impl Actor {
 
     async fn handle_setup_actor_stopping(&mut self, message: Stopping<setup_maker::Actor>) {
         self.setup_actors.gc(message);
+    }
+
+    async fn handle_rollover_actor_stopping(&mut self, message: Stopping<rollover_maker::Actor>) {
+        self.rollover_actors.gc(message);
     }
 
     async fn handle_settlement_actor_stopping(
