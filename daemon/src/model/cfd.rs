@@ -574,7 +574,28 @@ pub type UpdateCfdProposals = HashMap<OrderId, UpdateCfdProposal>;
 /// Represents a cfd (including state)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Cfd {
-    pub order: Order,
+    pub id: OrderId,
+
+    pub trading_pair: TradingPair,
+    pub position: Position,
+
+    pub price: Price,
+
+    pub leverage: Leverage,
+    pub liquidation_price: Price,
+
+    /// The duration that will be used for calculating the settlement timestamp
+    pub settlement_interval: Duration,
+
+    pub origin: Origin,
+
+    /// The id of the event to be used for price attestation
+    ///
+    /// The maker includes this into the Order based on the Oracle announcement to be used.
+    pub oracle_event_id: BitMexPriceEventId,
+
+    pub fee_rate: u32,
+
     pub quantity_usd: Usd,
     pub state: CfdState,
     /* TODO: Leverage is currently derived from the Order, but the actual leverage should be
@@ -584,18 +605,25 @@ pub struct Cfd {
 impl Cfd {
     pub fn new(order: Order, quantity: Usd, state: CfdState) -> Self {
         Cfd {
-            order,
+            id: order.id,
             quantity_usd: quantity,
             state,
+            trading_pair: order.trading_pair,
+            position: order.position,
+            price: order.price,
+            leverage: order.leverage,
+            liquidation_price: order.liquidation_price,
+            settlement_interval: order.settlement_interval,
+            origin: order.origin,
+            oracle_event_id: order.oracle_event_id,
+            fee_rate: order.fee_rate,
         }
     }
 
     pub fn margin(&self) -> Result<Amount> {
         let margin = match self.position() {
-            Position::Long => {
-                calculate_long_margin(self.order.price, self.quantity_usd, self.order.leverage)
-            }
-            Position::Short => calculate_short_margin(self.order.price, self.quantity_usd),
+            Position::Long => calculate_long_margin(self.price, self.quantity_usd, self.leverage),
+            Position::Short => calculate_short_margin(self.price, self.quantity_usd),
         };
 
         Ok(margin)
@@ -603,10 +631,8 @@ impl Cfd {
 
     pub fn counterparty_margin(&self) -> Result<Amount> {
         let margin = match self.position() {
-            Position::Long => calculate_short_margin(self.order.price, self.quantity_usd),
-            Position::Short => {
-                calculate_long_margin(self.order.price, self.quantity_usd, self.order.leverage)
-            }
+            Position::Long => calculate_short_margin(self.price, self.quantity_usd),
+            Position::Short => calculate_long_margin(self.price, self.quantity_usd, self.leverage),
         };
 
         Ok(margin)
@@ -621,10 +647,10 @@ impl Cfd {
         };
 
         let (p_n_l, p_n_l_percent) = calculate_profit(
-            self.order.price,
+            self.price,
             closing_price,
             self.quantity_usd,
-            self.order.leverage,
+            self.leverage,
             self.position(),
         )?;
 
@@ -636,12 +662,8 @@ impl Cfd {
         current_price: Price,
         n_payouts: usize,
     ) -> Result<SettlementProposal> {
-        let payout_curve = payout_curve::calculate(
-            self.order.price,
-            self.quantity_usd,
-            self.order.leverage,
-            n_payouts,
-        )?;
+        let payout_curve =
+            payout_curve::calculate(self.price, self.quantity_usd, self.leverage, n_payouts)?;
 
         let payout = {
             let current_price = current_price.try_into_u64()?;
@@ -652,7 +674,7 @@ impl Cfd {
         };
 
         let settlement = SettlementProposal {
-            order_id: self.order.id,
+            order_id: self.id,
             timestamp: Timestamp::now(),
             taker: *payout.taker_amount(),
             maker: *payout.maker_amount(),
@@ -663,11 +685,11 @@ impl Cfd {
     }
 
     pub fn position(&self) -> Position {
-        match self.order.origin {
-            Origin::Ours => self.order.position,
+        match self.origin {
+            Origin::Ours => self.position,
 
             // If the order is not our own we take the counter-position in the CFD
-            Origin::Theirs => match self.order.position {
+            Origin::Theirs => match self.position {
                 Position::Long => Position::Short,
                 Position::Short => Position::Long,
             },
@@ -675,7 +697,7 @@ impl Cfd {
     }
 
     pub fn refund_timelock_in_blocks(&self) -> u32 {
-        (self.order.settlement_interval * Cfd::REFUND_THRESHOLD)
+        (self.settlement_interval * Cfd::REFUND_THRESHOLD)
             .as_blocks()
             .ceil() as u32
     }
@@ -705,7 +727,7 @@ impl Cfd {
     pub fn handle_monitoring_event(&mut self, event: monitor::Event) -> Result<Option<CfdState>> {
         use CfdState::*;
 
-        let order_id = self.order.id;
+        let order_id = self.id;
 
         // early exit if already final
         if let SetupFailed { .. } | Closed { .. } | Refunded { .. } = self.state.clone() {
@@ -1149,7 +1171,7 @@ impl Cfd {
     }
 
     pub fn role(&self) -> Role {
-        self.order.origin.into()
+        self.origin.into()
     }
 
     pub fn dlc(&self) -> Option<Dlc> {

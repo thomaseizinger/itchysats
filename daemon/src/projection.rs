@@ -520,16 +520,16 @@ impl From<CfdsWithAuxData> for Vec<Cfd> {
                         (SignedAmount::ZERO, Decimal::ZERO.into())
                     });
 
-                let pending_proposal = input.pending_proposals.get(&cfd.order.id);
+                let pending_proposal = input.pending_proposals.get(&cfd.id);
                 let state = to_cfd_state(&cfd.state, pending_proposal);
 
                 Cfd {
-                    order_id: cfd.order.id,
-                    initial_price: cfd.order.price.into(),
-                    leverage: cfd.order.leverage,
-                    trading_pair: cfd.order.trading_pair.clone(),
+                    order_id: cfd.id,
+                    initial_price: cfd.price.into(),
+                    leverage: cfd.leverage,
+                    trading_pair: cfd.trading_pair.clone(),
                     position: cfd.position(),
-                    liquidation_price: cfd.order.liquidation_price.into(),
+                    liquidation_price: cfd.liquidation_price.into(),
                     quantity_usd: cfd.quantity_usd.into(),
                     profit_btc,
                     profit_in_percent: profit_in_percent.round_dp(1).to_string(),
@@ -543,7 +543,7 @@ impl From<CfdsWithAuxData> for Vec<Cfd> {
                     margin_counterparty: cfd.counterparty_margin().expect("margin to be available"),
                     details: to_cfd_details(cfd, network),
                     expiry_timestamp: match cfd.expiry_timestamp() {
-                        None => cfd.order.oracle_event_id.timestamp(),
+                        None => cfd.oracle_event_id.timestamp(),
                         Some(timestamp) => timestamp,
                     },
                 }

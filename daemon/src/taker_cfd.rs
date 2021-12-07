@@ -1,6 +1,6 @@
 use crate::address_map::{AddressMap, Stopping};
 use crate::cfd_actors::{self, append_cfd_state, insert_cfd_and_update_feed};
-use crate::db::{insert_order, load_cfd_by_order_id, load_order_by_id};
+use crate::db::load_cfd_by_order_id;
 use crate::model::cfd::{Cfd, CfdState, CfdStateCommon, Completed, Order, OrderId, Origin, Role};
 use crate::model::{Price, Usd};
 use crate::monitor::{self, MonitorParams};
@@ -48,6 +48,7 @@ pub struct Actor<O, M, W> {
     oracle_actor: Address<O>,
     n_payouts: usize,
     tasks: Tasks,
+    current_order: Option<Order>,
 }
 
 impl<O, M, W> Actor<O, M, W>
@@ -80,6 +81,7 @@ where
             collab_settlement_actors: AddressMap::default(),
             rollover_actors: AddressMap::default(),
             tasks: Tasks::default(),
+            current_order: None,
         }
     }
 }
@@ -187,10 +189,7 @@ impl<O, M, W> Actor<O, M, W> {
                     bail!("Received order {} from maker, but already have a cfd in the database for that order. The maker did not properly remove the order.", order.id)
                 }
 
-                if load_order_by_id(order.id, &mut conn).await.is_err() {
-                    // only insert the order if we don't know it yet
-                    insert_order(&order, &mut conn).await?;
-                }
+                self.current_order = Some(order.clone());
 
                 self.projection_actor
                     .send(projection::Update(Some(order)))
@@ -287,15 +286,14 @@ where
 
         let mut conn = self.db.acquire().await?;
 
-        let current_order = load_order_by_id(order_id, &mut conn).await?;
+        let current_order = self
+            .current_order
+            .clone()
+            .context("No current order from maker")?;
 
         tracing::info!("Taking current order: {:?}", &current_order);
 
-        let cfd = Cfd::new(
-            current_order.clone(),
-            quantity,
-            CfdState::outgoing_order_request(),
-        );
+        let cfd = Cfd::new(current_order, quantity, CfdState::outgoing_order_request());
 
         insert_cfd_and_update_feed(&cfd, &mut conn, &self.projection_actor).await?;
 
@@ -306,15 +304,15 @@ where
 
         let announcement = self
             .oracle_actor
-            .send(oracle::GetAnnouncement(cfd.order.oracle_event_id))
+            .send(oracle::GetAnnouncement(cfd.oracle_event_id))
             .await?
-            .with_context(|| format!("Announcement {} not found", cfd.order.oracle_event_id))?;
+            .with_context(|| format!("Announcement {} not found", cfd.oracle_event_id))?;
 
         let this = ctx
             .address()
             .expect("actor to be able to give address to itself");
         let (addr, fut) = setup_taker::Actor::new(
-            (current_order, quantity, self.n_payouts),
+            (cfd, self.n_payouts),
             (self.oracle_pk, announcement),
             &self.wallet,
             &self.wallet,
