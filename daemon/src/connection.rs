@@ -7,7 +7,7 @@ use crate::wire::{EncryptedJsonCodec, TakerToMaker, Version};
 use crate::{collab_settlement_taker, log_error, noise, rollover_taker, setup_taker, wire, Tasks};
 use anyhow::{anyhow, Context, Result};
 use bdk::bitcoin::Amount;
-use futures::{SinkExt, TryStreamExt};
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -204,11 +204,14 @@ impl Actor {
 
         tracing::info!(address = %address, "Established connection to maker");
 
+        let this = ctx.address().expect("self to be alive");
+
         let mut tasks = Tasks::default();
         tasks.add(
             ctx.notify_interval(self.heartbeat_timeout, || MeasurePulse)
                 .expect("self to be alive"),
         );
+        tasks.add(this.attach_stream(read.map(|item| MakerStreamMessage { item })));
 
         Ok(ConnectedState {
             last_heartbeat: SystemTime::now(),
