@@ -44,7 +44,7 @@ pub struct Actor {
 
 pub struct Connect {
     pub maker_identity: Identity,
-    pub maker_addr: SocketAddr,
+    pub maker_addresses: Vec<SocketAddr>,
 }
 
 pub struct MakerStreamMessage {
@@ -126,6 +126,97 @@ impl Actor {
             .socket
             .send(msg)
             .await?;
+
+        Ok(())
+    }
+
+    async fn connect(
+        &mut self,
+        identity: Identity,
+        address: SocketAddr,
+        ctx: &mut xtra::Context<Self>,
+    ) -> Result<()> {
+        tracing::debug!(address = %address, "Connecting to maker");
+
+        let (read, write, noise) = {
+            let mut connection = TcpStream::connect(&address)
+                .timeout(self.connect_timeout)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Connection attempt to {} timed out after {}s",
+                        address,
+                        self.connect_timeout.as_secs()
+                    )
+                })?
+                .with_context(|| format!("Failed to connect to {}", address))?;
+            let noise =
+                noise::initiator_handshake(&mut connection, &self.identity_sk, &identity.pk())
+                    .await?;
+
+            let (read, write) = connection.into_split();
+            (read, write, Arc::new(Mutex::new(noise)))
+        };
+
+        let mut read = FramedRead::new(read, wire::EncryptedJsonCodec::new(noise.clone()));
+        let mut write = FramedWrite::new(write, EncryptedJsonCodec::new(noise));
+
+        let our_version = Version::current();
+        write.send(TakerToMaker::Hello(our_version.clone())).await?;
+
+        match read
+            .try_next()
+            .timeout(Duration::from_secs(10))
+            .await
+            .with_context(|| {
+                format!(
+                    "Maker {} did not send Hello within 10 seconds, dropping connection",
+                    identity
+                )
+            })? {
+            Ok(Some(wire::MakerToTaker::Hello(maker_version))) => {
+                if our_version != maker_version {
+                    self.status_sender
+                        .send(ConnectionStatus::Offline {
+                            reason: Some(ConnectionCloseReason::VersionMismatch {
+                                taker_version: our_version.clone(),
+                                maker_version: maker_version.clone(),
+                            }),
+                        })
+                        .expect("receiver to outlive the actor");
+
+                    bail!(
+                        "Network version mismatch, we are on version {} but taker is on version {}",
+                        our_version,
+                        maker_version,
+                    )
+                }
+            }
+            unexpected_message => {
+                bail!(
+                    "Unexpected message {:?} from maker {}",
+                    unexpected_message,
+                    identity
+                )
+            }
+        }
+
+        tracing::info!(address = %address, "Established connection to maker");
+
+        let mut tasks = Tasks::default();
+        tasks.add(
+            ctx.notify_interval(self.heartbeat_timeout, || MeasurePulse)
+                .expect("self to be alive"),
+        );
+
+        self.connected_state = Some(ConnectedState {
+            last_heartbeat: SystemTime::now(),
+            _tasks: tasks,
+            socket: write,
+        });
+        self.status_sender
+            .send(ConnectionStatus::Online)
+            .expect("receiver to outlive the actor");
 
         Ok(())
     }
@@ -221,97 +312,27 @@ impl Actor {
     async fn handle_connect(
         &mut self,
         Connect {
-            maker_addr,
+            maker_addresses,
             maker_identity,
         }: Connect,
         ctx: &mut xtra::Context<Self>,
     ) -> Result<()> {
-        tracing::debug!(address = %maker_addr, "Connecting to maker");
+        let num_addresses = maker_addresses.len();
 
-        let (read, write, noise) = {
-            let mut connection = TcpStream::connect(&maker_addr)
-                .timeout(self.connect_timeout)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Connection attempt to {} timed out after {}s",
-                        maker_addr,
-                        self.connect_timeout.as_secs()
-                    )
-                })?
-                .with_context(|| format!("Failed to connect to {}", maker_addr))?;
-            let noise = noise::initiator_handshake(
-                &mut connection,
-                &self.identity_sk,
-                &maker_identity.pk(),
-            )
-            .await?;
-
-            let (read, write) = connection.into_split();
-            (read, write, Arc::new(Mutex::new(noise)))
-        };
-
-        let mut read = FramedRead::new(read, wire::EncryptedJsonCodec::new(noise.clone()));
-        let mut write = FramedWrite::new(write, EncryptedJsonCodec::new(noise));
-
-        let our_version = Version::current();
-        write.send(TakerToMaker::Hello(our_version.clone())).await?;
-
-        match read
-            .try_next()
-            .timeout(Duration::from_secs(10))
-            .await
-            .with_context(|| {
-                format!(
-                    "Maker {} did not send Hello within 10 seconds, dropping connection",
-                    maker_identity
-                )
-            })? {
-            Ok(Some(wire::MakerToTaker::Hello(maker_version))) => {
-                if our_version != maker_version {
-                    self.status_sender
-                        .send(ConnectionStatus::Offline {
-                            reason: Some(ConnectionCloseReason::VersionMismatch {
-                                taker_version: our_version.clone(),
-                                maker_version: maker_version.clone(),
-                            }),
-                        })
-                        .expect("receiver to outlive the actor");
-
-                    bail!(
-                        "Network version mismatch, we are on version {} but taker is on version {}",
-                        our_version,
-                        maker_version,
-                    )
+        for address in maker_addresses {
+            match self.connect(maker_identity, address, ctx).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(%address, "Failed to establish connection: {:#}", e);
+                    continue;
                 }
-            }
-            unexpected_message => {
-                bail!(
-                    "Unexpected message {:?} from maker {}",
-                    unexpected_message,
-                    maker_identity
-                )
             }
         }
 
-        tracing::info!(address = %maker_addr, "Established connection to maker");
-
-        let mut tasks = Tasks::default();
-        tasks.add(
-            ctx.notify_interval(self.heartbeat_timeout, || MeasurePulse)
-                .expect("self to be alive"),
-        );
-
-        self.connected_state = Some(ConnectedState {
-            last_heartbeat: SystemTime::now(),
-            _tasks: tasks,
-            socket: write,
-        });
-        self.status_sender
-            .send(ConnectionStatus::Online)
-            .expect("receiver to outlive the actor");
-
-        Ok(())
+        bail!(
+            "Attempted to connect to {} addresses, all failed",
+            num_addresses
+        )
     }
 
     async fn handle_wire_message(
