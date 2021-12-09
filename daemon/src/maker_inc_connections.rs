@@ -123,6 +123,13 @@ impl Actor {
         let transport_state = noise::responder_handshake(&mut stream, &self.noise_priv_key).await?;
         let taker_id = Identity::new(transport_state.get_remote_public_key()?);
 
+        if self.write_connections.contains_key(&taker_id) {
+            bail!(
+                "Refusing to accept 2nd connection from already connected taker {}!",
+                taker_id
+            )
+        }
+
         let transport_state = Arc::new(Mutex::new(transport_state));
 
         let (read, write) = stream.into_split();
