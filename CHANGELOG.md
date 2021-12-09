@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2021-12-09
+
 ## [0.3.0] - 2021-12-09
 
 Initial release for mainnet.
 
-[Unreleased]: https://github.com/itchysats/itchysats/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/thomaseizinger/itchysats/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/thomaseizinger/itchysats/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/itchysats/itchysats/compare/d12e04d4954deb2ee9ebdc9...0.3.0
