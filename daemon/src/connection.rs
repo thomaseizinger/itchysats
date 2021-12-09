@@ -4,17 +4,15 @@ use crate::model::{Identity, Price, Timestamp, Usd};
 use crate::taker_cfd::CurrentOrder;
 use crate::tokio_ext::FutureExt;
 use crate::wire::{EncryptedJsonCodec, TakerToMaker, Version};
-use crate::{
-    collab_settlement_taker, log_error, noise, rollover_taker, send_to_socket, setup_taker, wire,
-    Tasks,
-};
+use crate::{collab_settlement_taker, log_error, noise, rollover_taker, setup_taker, wire, Tasks};
 use anyhow::{bail, Context, Result};
 use bdk::bitcoin::Amount;
-use futures::{SinkExt, StreamExt, TryStreamExt};
+use futures::{SinkExt, TryStreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -27,13 +25,12 @@ const CONNECT_TO_MAKER_INTERVAL: Duration = Duration::from_secs(5);
 
 struct ConnectedState {
     last_heartbeat: SystemTime,
+    socket: FramedWrite<OwnedWriteHalf, EncryptedJsonCodec<wire::TakerToMaker>>,
     _tasks: Tasks,
 }
 
 pub struct Actor {
     status_sender: watch::Sender<ConnectionStatus>,
-    send_to_maker: Box<dyn MessageChannel<wire::TakerToMaker>>,
-    send_to_maker_ctx: xtra::Context<send_to_socket::Actor<wire::TakerToMaker>>,
     identity_sk: x25519_dalek::StaticSecret,
     current_order: Box<dyn MessageChannel<CurrentOrder>>,
     /// Max duration since the last heartbeat until we die.
@@ -109,12 +106,8 @@ impl Actor {
         hearthbeat_timeout: Duration,
         connect_timeout: Duration,
     ) -> Self {
-        let (send_to_maker_addr, send_to_maker_ctx) = xtra::Context::new(None);
-
         Self {
             status_sender,
-            send_to_maker: Box::new(send_to_maker_addr),
-            send_to_maker_ctx,
             identity_sk,
             current_order: current_order.clone_channel(),
             heartbeat_timeout: hearthbeat_timeout,
@@ -125,12 +118,31 @@ impl Actor {
             rollover_actors: AddressMap::default(),
         }
     }
+
+    async fn send_message(&mut self, msg: wire::TakerToMaker) -> Result<()> {
+        self.connected_state
+            .as_mut()
+            .context("No connection")?
+            .socket
+            .send(msg)
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[xtra_productivity(message_impl = false)]
 impl Actor {
     async fn handle_taker_to_maker(&mut self, message: wire::TakerToMaker) {
-        log_error!(self.send_to_maker.send(message));
+        let msg_str = message.to_string();
+
+        if let Err(e) = self
+            .send_message(message)
+            .await
+            .with_context(|| format!("Failed to send {}", msg_str))
+        {
+            tracing::error!("{:#}", e);
+        }
     }
 
     async fn handle_collab_settlement_actor_stopping(
@@ -148,12 +160,11 @@ impl Actor {
 #[xtra_productivity]
 impl Actor {
     async fn handle_take_order(&mut self, msg: TakeOrder) -> Result<()> {
-        self.send_to_maker
-            .send(wire::TakerToMaker::TakeOrder {
-                order_id: msg.order_id,
-                quantity: msg.quantity,
-            })
-            .await?;
+        self.send_message(wire::TakerToMaker::TakeOrder {
+            order_id: msg.order_id,
+            quantity: msg.quantity,
+        })
+        .await?;
 
         self.setup_actors.insert(msg.order_id, msg.address);
 
@@ -170,17 +181,16 @@ impl Actor {
             address,
         } = msg;
 
-        self.send_to_maker
-            .send(wire::TakerToMaker::Settlement {
-                order_id,
-                msg: wire::taker_to_maker::Settlement::Propose {
-                    timestamp,
-                    taker,
-                    maker,
-                    price,
-                },
-            })
-            .await?;
+        self.send_message(wire::TakerToMaker::Settlement {
+            order_id,
+            msg: wire::taker_to_maker::Settlement::Propose {
+                timestamp,
+                taker,
+                maker,
+                price,
+            },
+        })
+        .await?;
 
         self.collab_settlement_actors.insert(order_id, address);
 
@@ -194,12 +204,11 @@ impl Actor {
             address,
         } = msg;
 
-        self.send_to_maker
-            .send(wire::TakerToMaker::ProposeRollOver {
-                order_id,
-                timestamp,
-            })
-            .await?;
+        self.send_message(wire::TakerToMaker::ProposeRollOver {
+            order_id,
+            timestamp,
+        })
+        .await?;
 
         self.rollover_actors.insert(order_id, address);
 
@@ -287,21 +296,16 @@ impl Actor {
 
         tracing::info!(address = %maker_addr, "Established connection to maker");
 
-        let this = ctx.address().expect("self to be alive");
-
-        let send_to_socket = send_to_socket::Actor::new(write);
-
         let mut tasks = Tasks::default();
-        tasks.add(self.send_to_maker_ctx.attach(send_to_socket));
-        tasks.add(this.attach_stream(read.map(move |item| MakerStreamMessage { item })));
         tasks.add(
             ctx.notify_interval(self.heartbeat_timeout, || MeasurePulse)
-                .expect("we just started"),
+                .expect("self to be alive"),
         );
 
         self.connected_state = Some(ConnectedState {
             last_heartbeat: SystemTime::now(),
             _tasks: tasks,
+            socket: write,
         });
         self.status_sender
             .send(ConnectionStatus::Online)
