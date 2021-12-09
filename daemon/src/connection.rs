@@ -5,7 +5,7 @@ use crate::taker_cfd::CurrentOrder;
 use crate::tokio_ext::FutureExt;
 use crate::wire::{EncryptedJsonCodec, TakerToMaker, Version};
 use crate::{collab_settlement_taker, log_error, noise, rollover_taker, setup_taker, wire, Tasks};
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use bdk::bitcoin::Amount;
 use futures::{SinkExt, TryStreamExt};
 use std::collections::HashMap;
@@ -47,6 +47,14 @@ pub struct Connect {
     pub maker_addresses: Vec<SocketAddr>,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ConnectError {
+    #[error("Connection got closed")]
+    Closed(ConnectionCloseReason),
+    #[error("Made {number} attempts, all failed")]
+    AllAttemptsFailed { number: usize },
+}
+
 pub struct MakerStreamMessage {
     pub item: Result<wire::MakerToTaker>,
 }
@@ -62,8 +70,11 @@ pub enum ConnectionStatus {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ConnectionCloseReason {
+    #[error(
+        "Network version mismatch, taker is on {taker_version} and maker is on {maker_version}"
+    )]
     VersionMismatch {
         taker_version: Version,
         maker_version: Version,
@@ -131,23 +142,19 @@ impl Actor {
     }
 
     async fn connect(
-        &mut self,
+        &self,
         identity: Identity,
         address: SocketAddr,
         ctx: &mut xtra::Context<Self>,
-    ) -> Result<()> {
+    ) -> Result<ConnectedState, FailedToConnect> {
         tracing::debug!(address = %address, "Connecting to maker");
 
         let (read, write, noise) = {
             let mut connection = TcpStream::connect(&address)
                 .timeout(self.connect_timeout)
                 .await
-                .with_context(|| {
-                    format!(
-                        "Connection attempt to {} timed out after {}s",
-                        address,
-                        self.connect_timeout.as_secs()
-                    )
+                .map_err(|_| FailedToConnect::Timeout {
+                    duration: self.connect_timeout.as_secs(),
                 })?
                 .with_context(|| format!("Failed to connect to {}", address))?;
             let noise =
@@ -162,42 +169,36 @@ impl Actor {
         let mut write = FramedWrite::new(write, EncryptedJsonCodec::new(noise));
 
         let our_version = Version::current();
-        write.send(TakerToMaker::Hello(our_version.clone())).await?;
+        write
+            .send(TakerToMaker::Hello(our_version.clone()))
+            .await
+            .context("Failed to send `Hello`")?;
 
         match read
             .try_next()
             .timeout(Duration::from_secs(10))
             .await
-            .with_context(|| {
-                format!(
-                    "Maker {} did not send Hello within 10 seconds, dropping connection",
-                    identity
-                )
-            })? {
+            .context("No message after 10 seconds")
+            .map_err(|e| FailedToConnect::NoHelloMessage { source: e })?
+        {
             Ok(Some(wire::MakerToTaker::Hello(maker_version))) => {
                 if our_version != maker_version {
-                    self.status_sender
-                        .send(ConnectionStatus::Offline {
-                            reason: Some(ConnectionCloseReason::VersionMismatch {
-                                taker_version: our_version.clone(),
-                                maker_version: maker_version.clone(),
-                            }),
-                        })
-                        .expect("receiver to outlive the actor");
-
-                    bail!(
-                        "Network version mismatch, we are on version {} but taker is on version {}",
-                        our_version,
-                        maker_version,
-                    )
+                    return Err(FailedToConnect::VersionMismatch {
+                        taker: our_version,
+                        maker: maker_version,
+                    });
                 }
             }
-            unexpected_message => {
-                bail!(
-                    "Unexpected message {:?} from maker {}",
-                    unexpected_message,
-                    identity
-                )
+            Ok(Some(msg)) => {
+                return Err(FailedToConnect::NoHelloMessage {
+                    source: anyhow!("Expected `Hello` but got {}", msg),
+                });
+            }
+            Ok(None) => {
+                return Err(FailedToConnect::Other(anyhow!("EOF")));
+            }
+            Err(e) => {
+                return Err(FailedToConnect::Other(e));
             }
         }
 
@@ -209,17 +210,24 @@ impl Actor {
                 .expect("self to be alive"),
         );
 
-        self.connected_state = Some(ConnectedState {
+        Ok(ConnectedState {
             last_heartbeat: SystemTime::now(),
             _tasks: tasks,
             socket: write,
-        });
-        self.status_sender
-            .send(ConnectionStatus::Online)
-            .expect("receiver to outlive the actor");
-
-        Ok(())
+        })
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+enum FailedToConnect {
+    #[error("Connection attempt timed out after {duration} seconds")]
+    Timeout { duration: u64 },
+    #[error("Maker did not send a `Hello` message")]
+    NoHelloMessage { source: anyhow::Error },
+    #[error("Network version mismatch; ours is {taker}, theirs is {maker}")]
+    VersionMismatch { taker: Version, maker: Version },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 #[xtra_productivity(message_impl = false)]
@@ -316,23 +324,41 @@ impl Actor {
             maker_identity,
         }: Connect,
         ctx: &mut xtra::Context<Self>,
-    ) -> Result<()> {
+    ) -> Result<(), ConnectError> {
         let num_addresses = maker_addresses.len();
 
         for address in maker_addresses {
             match self.connect(maker_identity, address, ctx).await {
-                Ok(()) => return Ok(()),
+                Ok(connected) => {
+                    self.connected_state = Some(connected);
+                    self.status_sender
+                        .send(ConnectionStatus::Online)
+                        .expect("receiver to outlive the actor");
+
+                    return Ok(());
+                }
+                Err(FailedToConnect::VersionMismatch { taker, maker }) => {
+                    let reason = ConnectionCloseReason::VersionMismatch {
+                        taker_version: taker,
+                        maker_version: maker,
+                    };
+
+                    let _ = self.status_sender.send(ConnectionStatus::Offline {
+                        reason: Some(reason.clone()),
+                    });
+
+                    return Err(ConnectError::Closed(reason));
+                }
                 Err(e) => {
-                    tracing::warn!(%address, "Failed to establish connection: {:#}", e);
+                    tracing::warn!(%address, "Failed to establish connection: {:#}", anyhow!(e)); // format as anyhow to get entire backtrace
                     continue;
                 }
             }
         }
 
-        bail!(
-            "Attempted to connect to {} addresses, all failed",
-            num_addresses
-        )
+        return Err(ConnectError::AllAttemptsFailed {
+            number: num_addresses,
+        });
     }
 
     async fn handle_wire_message(
@@ -470,33 +496,38 @@ pub async fn connect(
         let connection_status = maker_online_status_feed_receiver.borrow().clone();
         if matches!(connection_status, ConnectionStatus::Offline { .. }) {
             tracing::debug!("No connection to the maker");
-            'connect: loop {
-                for address in &maker_addresses {
-                    let connect_msg = Connect {
-                        maker_identity,
-                        maker_addr: *address,
-                    };
 
-                    if let Err(e) = connection_actor_addr
-                        .send(connect_msg)
-                        .await
-                        .expect("Taker actor to be present")
-                    {
-                        tracing::warn!(%address, "Failed to establish connection: {:#}", e);
-                        continue;
-                    }
-                    break 'connect;
+            let connect_msg = Connect {
+                maker_identity,
+                maker_addresses: maker_addresses.clone(),
+            };
+
+            match connection_actor_addr
+                .send(connect_msg)
+                .await
+                .expect("Connection actor to be present")
+            {
+                Ok(()) => continue,
+                Err(ConnectError::Closed(reason)) => {
+                    tracing::warn!(
+                        %maker_identity,
+                        "Established a connection but got immediately closed: {}",
+                        reason
+                    );
+                    return; // stop the retry, this is a permanent error
                 }
-
-                tracing::warn!(
-                    "Tried connecting to {} addresses without success, retrying in {} seconds",
-                    maker_addresses.len(),
-                    CONNECT_TO_MAKER_INTERVAL.as_secs()
-                );
-
-                tokio::time::sleep(CONNECT_TO_MAKER_INTERVAL).await;
+                Err(e) => {
+                    tracing::warn!("{:#}", anyhow!(e));
+                }
             }
+
+            tracing::debug!(
+                "Attempting to reconnect in {}s",
+                CONNECT_TO_MAKER_INTERVAL.as_secs()
+            );
+            tokio::time::sleep(CONNECT_TO_MAKER_INTERVAL).await;
         }
+
         maker_online_status_feed_receiver
             .changed()
             .await
