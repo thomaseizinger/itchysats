@@ -45,39 +45,11 @@ jobs:
       - name: Fetch all tags (workaround for https://github.com/actions/checkout/issues/290)
         run: git fetch --tags --force
 
-      - name: Install toolchain from `rust-toolchain.toml`
-        run: rustup show
-
-      - uses: Swatinem/rust-cache@v1.3.0
+      - uses: ./.github/actions/build-release-binary
+        id: build
         with:
-          key: ${{ matrix.target }}
-
-      - name: Install compiler for aarch64 arch (armv8)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install 'gcc-aarch64-linux-gnu'
-
-      - uses: actions/setup-node@v2
-        with:
-          node-version: '16'
-          cache: yarn
-          cache-dependency-path: '${{ matrix.bin }}-frontend/yarn.lock'
-
-      - name: Build ${{ matrix.bin }} frontend
-        shell: bash
-        run: |
-          cd ${{ matrix.bin }}-frontend;
-          yarn
-          yarn build
-
-      - name: Build ${{ matrix.target }} ${{ matrix.bin }} release binary
-        run: cargo build --target=${{ matrix.target }} --release --bin ${{ matrix.bin }}
-
-      - name: Smoke test the binary
-        # aarch64-* is only cross-compiled, no smoke test
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: target/${{ matrix.target }}/release/${{ matrix.bin }} --help
+          target: ${{ matrix.target }}
+          binary: ${{ matrix.bin }}
 
       # Remove once python 3 is the default
       - uses: actions/setup-python@v2.3.1

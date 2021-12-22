@@ -1,0 +1,103 @@
+name: "Build and release docker image"
+
+on:
+  push:
+    branches:
+      - master
+  release:
+    types:
+      - created
+
+jobs:
+  # We build the binaries outside of docker because here we can parallelize.
+  build_docker_image:
+    name: Build release binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - bin: taker
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - bin: taker
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - bin: maker
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - bin: maker
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v2.4.0 # This should do the right thing for push to master and new releases.
+        with:
+          token: ${{ secrets.ITCHY_GITHUB_TOKEN }}
+
+      - name: Fetch all tags (workaround for https://github.com/actions/checkout/issues/290)
+        run: git fetch --tags --force
+
+      - uses: ./.github/actions/build-release-binary
+        id: build
+        with:
+          target: ${{ matrix.target }}
+          binary: ${{ matrix.bin }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+
+
+
+      - name: Login into github registry
+        uses: docker/login-action@v1.11.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+  build_docker_images:
+    name: Build docker images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        bin: [maker,taker]
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v2.4.0
+
+
+      - name: Set up docker buildx
+        uses: docker/setup-buildx-action@v1
+
+
+
+      # docker buildx requires to build all images that only differ in ARCH to be build at the same time, hence we cannot use a matrix for this.
+      - uses: actions/download-artifact@v2
+        with:
+          name: ${{ matrix.bin }}-x86_64-unknown-linux-gnu
+
+      - uses: actions/download-artifact@v2
+        with:
+          name: ${{ matrix.bin }}-aarch64-unknown-linux-gnu
+
+      - name: Build docker image for ${{matrix.bin}}
+        run: |
+          VERSION=${{ github.event.inputs.release_tag }}
+
+          if [ "$VERSION" = "preview" ]; then
+              VERSION=latest
+          fi
+
+          docker buildx build \
+              --push \
+              --platform linux/amd64,linux/arm64 \
+              --label "org.opencontainers.image.source https://github.com/${{ github.repository }}" \
+              --tag ghcr.io/${{ github.repository }}/${{matrix.bin}}:${VERSION} \
+              --build-arg BINARY_PATH=${{matrix.bin}} \
+              .
