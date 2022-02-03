@@ -1,3 +1,5 @@
 *
-target
-!target/release
+!target/x86_64-unknown-linux-gnu/release/maker
+!target/x86_64-unknown-linux-gnu/release/taker
+!target/aarch64-unknown-linux-gnu/release/maker
+!target/aarch64-unknown-linux-gnu/release/taker
